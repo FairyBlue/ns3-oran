@@ -39,7 +39,11 @@ namespace ns3
 /**
  * @ingroup oran
  *
- * E2 Node Terminator for Wired Nodes. No Commands are processed by this Terminator.
+ * Legacy E2 Node Terminator for generic non-LTE nodes.
+ *
+ * Despite the historical "Wired" name used by the ns-3 O-RAN module, this
+ * class acts as a generic node-side E2 terminator in abstract transport
+ * scenarios and does not imply a specific physical medium.
  */
 class OranE2NodeTerminatorWired : public OranE2NodeTerminator
 {
@@ -60,15 +64,14 @@ class OranE2NodeTerminatorWired : public OranE2NodeTerminator
     ~OranE2NodeTerminatorWired() override;
     /**
      * Get the E2 Node Type. For this Terminator this method always returns the
-     * WIRED node type
+     * legacy WIRED node type used by the module for generic non-LTE nodes.
      *
      * @return the E2 Node Type.
      */
     OranNearRtRic::NodeType GetNodeType() const override;
     /**
-     * Receive a Command. All Commands are silently discarded.
-     *
-     * Currently this terminator silently discards received commands.
+     * Receive a Command and forward supported control updates to the local
+     * forwarding application.
      *
      * @param command The received command.
      */

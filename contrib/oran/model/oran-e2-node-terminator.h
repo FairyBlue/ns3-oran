@@ -38,6 +38,7 @@
 #include "ns3/node.h"
 #include "ns3/object.h"
 #include "ns3/random-variable-stream.h"
+#include "ns3/traced-callback.h"
 
 namespace ns3
 {
@@ -136,6 +137,14 @@ class OranE2NodeTerminator : public Object
      * @param e2NodeId A valid E2 Node ID or 0 to indicate a failed registration request.
      */
     virtual void ReceiveRegistrationResponse(uint64_t e2NodeId);
+    /**
+     * Refresh the registration against the currently configured Near-RT RIC.
+     */
+    virtual void RefreshRegistration();
+    /**
+     * Force the attached reporters to generate and send reports immediately.
+     */
+    virtual void RequestImmediateReports();
 
   protected:
     /**
@@ -222,6 +231,10 @@ class OranE2NodeTerminator : public Object
      * The random variable used to to determine the transmission delay of a report.
      */
     Ptr<RandomVariableStream> m_transmissionDelayRv;
+    /**
+     * Trace fired for each report transmitted over E2.
+     */
+    TracedCallback<uint64_t, std::string> m_reportSent;
 
   public:
     /**

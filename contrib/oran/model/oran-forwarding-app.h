@@ -35,6 +35,7 @@
 #include "ns3/event-id.h"
 #include "ns3/ipv4-address.h"
 #include "ns3/ptr.h"
+#include "ns3/random-variable-stream.h"
 #include "ns3/socket.h"
 #include "ns3/traced-callback.h"
 
@@ -79,6 +80,12 @@ class OranForwardingApp : public Application
      * @param destination The IP address to forward to
      */
     void UpdateForwardingTable(const std::string& target, const Ipv4Address& destination);
+
+    /**
+     * @brief Receive a control command from either the UDP socket or the virtual E2 path.
+     * @param command The command string to execute
+     */
+    void ReceiveControlCommand(const std::string& command);
 
     /**
      * @brief Get the current forwarding table
@@ -149,6 +156,7 @@ class OranForwardingApp : public Application
     uint16_t m_port;                                       //!< Port number for control commands
     uint16_t m_dataPort;                                   //!< Port number for data forwarding
     std::string m_nodeType;                                //!< Node type (ODU or OCU)
+    Ptr<RandomVariableStream> m_commandProcessingDelayRv;  //!< Delay before applying a command
     
     // Sockets
     Ptr<Socket> m_controlSocket;                           //!< Socket for receiving control commands
@@ -170,6 +178,7 @@ class OranForwardingApp : public Application
     // Traced callbacks
     TracedCallback<std::string> m_forwardingCommand;       //!< Trace for forwarding commands
     TracedCallback<uint32_t, Ipv4Address, Ipv4Address> m_dataForwarded; //!< Trace for forwarded data
+    TracedCallback<std::string, Ipv4Address> m_forwardingTableUpdated;  //!< Trace for applied forwarding entries
 
 }; // class OranForwardingApp
 

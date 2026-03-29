@@ -90,7 +90,11 @@ OranE2NodeTerminator::GetTypeId()
                           "delay for a report.",
                           StringValue("ns3::ConstantRandomVariable[Constant=0]"),
                           MakePointerAccessor(&OranE2NodeTerminator::m_transmissionDelayRv),
-                          MakePointerChecker<RandomVariableStream>());
+                          MakePointerChecker<RandomVariableStream>())
+            .AddTraceSource("ReportSent",
+                            "A report was transmitted from a node-side E2 terminator",
+                            MakeTraceSourceAccessor(&OranE2NodeTerminator::m_reportSent),
+                            "ns3::TracedCallback::Uint64String");
 
     return tid;
 }
@@ -228,6 +232,17 @@ OranE2NodeTerminator::ReceiveRegistrationResponse(uint64_t e2NodeId)
 }
 
 void
+OranE2NodeTerminator::RefreshRegistration()
+{
+    NS_LOG_FUNCTION(this);
+
+    if (m_active)
+    {
+        Register();
+    }
+}
+
+void
 OranE2NodeTerminator::CancelNextRegistration()
 {
     NS_LOG_FUNCTION(this);
@@ -294,6 +309,7 @@ OranE2NodeTerminator::DoSendReports()
 
         for (const auto& r : m_reports)
         {
+            m_reportSent(r->GetReporterE2NodeId(), r->GetInstanceTypeId().GetName());
             Simulator::Schedule(Seconds(m_transmissionDelayRv->GetValue()),
                                 &OranNearRtRicE2Terminator::ReceiveReport,
                                 m_nearRtRic->GetE2Terminator(),
@@ -302,6 +318,24 @@ OranE2NodeTerminator::DoSendReports()
 
         m_reports.clear();
         ScheduleNextSend();
+    }
+}
+
+void
+OranE2NodeTerminator::RequestImmediateReports()
+{
+    NS_LOG_FUNCTION(this);
+
+    if (m_active)
+    {
+        CancelNextSend();
+
+        for (auto reporter : m_reporters)
+        {
+            reporter->PerformReport();
+        }
+
+        DoSendReports();
     }
 }
 

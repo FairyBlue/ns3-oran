@@ -70,6 +70,12 @@ class OranCommand : public Object
      */
     virtual std::string ToString() const;
     /**
+     * Set the target E2 Node ID.
+     *
+     * @param targetE2NodeId The target E2 Node ID.
+     */
+    void SetTargetE2NodeId(uint64_t targetE2NodeId);
+    /**
      * Get the target E2 Node ID.
      *
      * @return The target E2 Node Id.

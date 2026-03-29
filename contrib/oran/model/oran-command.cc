@@ -74,6 +74,14 @@ OranCommand::ToString() const
     return "Parent OranCommand. Should not be used";
 }
 
+void
+OranCommand::SetTargetE2NodeId(uint64_t targetE2NodeId)
+{
+    NS_LOG_FUNCTION(this << targetE2NodeId);
+
+    m_targetE2NodeId = targetE2NodeId;
+}
+
 uint64_t
 OranCommand::GetTargetE2NodeId() const
 {

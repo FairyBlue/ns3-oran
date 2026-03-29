@@ -1,0 +1,2 @@
+event_id,baseline_total_mbps,min_total_mbps,throughput_drop_mbps,throughput_drop_pct,min_time_s,recovery_time_s,recovery_latency_ms
+0,13.0007,3.93216,9.06854,69.7543,8.05,8.15,150

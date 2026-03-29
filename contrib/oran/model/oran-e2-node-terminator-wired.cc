@@ -30,6 +30,9 @@
 
 #include "oran-e2-node-terminator-wired.h"
 
+#include "oran-command-forward.h"
+#include "oran-forwarding-app.h"
+
 #include "ns3/abort.h"
 #include "ns3/log.h"
 #include "ns3/node.h"
@@ -77,7 +80,33 @@ OranE2NodeTerminatorWired::ReceiveCommand(Ptr<OranCommand> command)
 
     if (m_active)
     {
-        // No supported commands yet.
+        Ptr<OranCommandForward> forwardingCommand = DynamicCast<OranCommandForward>(command);
+        if (forwardingCommand == nullptr)
+        {
+            NS_LOG_WARN("Unsupported command received by the node-side E2 terminator "
+                        << "(legacy WIRED class): "
+                        << command->GetInstanceTypeId().GetName());
+            return;
+        }
+
+        Ptr<Node> node = GetNode();
+        NS_ABORT_MSG_IF(node == nullptr,
+                        "Attempting to apply a forwarding command on a null node attached "
+                        "to the legacy WIRED E2 terminator");
+
+        for (uint32_t i = 0; i < node->GetNApplications(); ++i)
+        {
+            Ptr<OranForwardingApp> forwardingApp =
+                DynamicCast<OranForwardingApp>(node->GetApplication(i));
+            if (forwardingApp != nullptr)
+            {
+                forwardingApp->ReceiveControlCommand(forwardingCommand->ToString());
+                return;
+            }
+        }
+
+        NS_LOG_WARN("No OranForwardingApp found on node " << node->GetId()
+                    << " for forwarding command");
     }
 }
 

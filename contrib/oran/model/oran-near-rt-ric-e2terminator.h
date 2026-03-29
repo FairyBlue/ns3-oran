@@ -37,6 +37,7 @@
 
 #include "ns3/object.h"
 #include "ns3/random-variable-stream.h"
+#include "ns3/traced-callback.h"
 
 #include <map>
 #include <vector>
@@ -151,6 +152,14 @@ class OranNearRtRicE2Terminator : public Object
      * The random variable used to to determine the transmission delay of a command.
      */
     Ptr<RandomVariableStream> m_transmissionDelayRv;
+    /**
+     * Trace fired for each report received at the Near-RT RIC.
+     */
+    TracedCallback<uint64_t, std::string, uint32_t> m_reportReceived;
+    /**
+     * Trace fired for each command transmitted from the Near-RT RIC.
+     */
+    TracedCallback<uint64_t, std::string, uint32_t> m_commandSent;
 }; // class  OranNearRtRicE2Terminator
 
 } // namespace ns3

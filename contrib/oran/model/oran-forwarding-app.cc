@@ -35,12 +35,14 @@
 #include "ns3/ipv4.h"
 #include "ns3/log.h"
 #include "ns3/packet.h"
+#include "ns3/pointer.h"
 #include "ns3/simulator.h"
 #include "ns3/socket-factory.h"
 #include "ns3/string.h"
 #include "ns3/udp-socket-factory.h"
 #include "ns3/uinteger.h"
 
+#include <algorithm>
 #include <sstream>
 
 namespace ns3
@@ -72,6 +74,13 @@ OranForwardingApp::GetTypeId()
                                           StringValue("ODU"),
                                           MakeStringAccessor(&OranForwardingApp::m_nodeType),
                                           MakeStringChecker())
+                            .AddAttribute("CommandProcessingDelayRv",
+                                          "The random variable used to model the local delay "
+                                          "before applying a forwarding command.",
+                                          StringValue("ns3::ConstantRandomVariable[Constant=0]"),
+                                          MakePointerAccessor(
+                                              &OranForwardingApp::m_commandProcessingDelayRv),
+                                          MakePointerChecker<RandomVariableStream>())
                             .AddAttribute("StatusReportInterval",
                                           "Interval for sending status reports",
                                           TimeValue(Seconds(10)),
@@ -84,7 +93,12 @@ OranForwardingApp::GetTypeId()
                             .AddTraceSource("DataForwarded",
                                             "Data was forwarded to another node",
                                             MakeTraceSourceAccessor(&OranForwardingApp::m_dataForwarded),
-                                            "ns3::TracedValueCallback::Uint32Ipv4Ipv4");
+                                            "ns3::TracedValueCallback::Uint32Ipv4Ipv4")
+                            .AddTraceSource(
+                                "ForwardingTableUpdated",
+                                "A forwarding-table entry was applied",
+                                MakeTraceSourceAccessor(&OranForwardingApp::m_forwardingTableUpdated),
+                                "ns3::TracedCallback::StringIpv4");
     return tid;
 }
 
@@ -115,6 +129,7 @@ OranForwardingApp::DoDispose()
     m_controlSocket = nullptr;
     m_dataSocket = nullptr;
     m_sendSocket = nullptr;
+    m_commandProcessingDelayRv = nullptr;
     Application::DoDispose();
 }
 
@@ -216,15 +231,35 @@ OranForwardingApp::HandleControlCommand(Ptr<Socket> socket)
             delete[] buffer;
 
             NS_LOG_INFO("Received control command: " << command);
-            m_commandsReceived++;
-            
-            // Fire trace
-            m_forwardingCommand(command);
-            
-            // Execute the command
-            ExecuteForwardingCommand(command);
+            ReceiveControlCommand(command);
         }
     }
+}
+
+void
+OranForwardingApp::ReceiveControlCommand(const std::string& command)
+{
+    NS_LOG_FUNCTION(this << command);
+
+    if (command.empty())
+    {
+        NS_LOG_WARN("Ignoring empty forwarding command");
+        return;
+    }
+
+    m_commandsReceived++;
+    m_forwardingCommand(command);
+
+    double delay = 0.0;
+    if (m_commandProcessingDelayRv != nullptr)
+    {
+        delay = std::max(0.0, m_commandProcessingDelayRv->GetValue());
+    }
+
+    Simulator::Schedule(Seconds(delay),
+                        &OranForwardingApp::ExecuteForwardingCommand,
+                        this,
+                        command);
 }
 
 void
@@ -251,15 +286,23 @@ OranForwardingApp::HandleDataReceive(Ptr<Socket> socket)
                 auto it = m_forwardingTable.begin();
                 std::string target = it->first;
                 Ipv4Address destination = it->second;
-                
-                NS_LOG_INFO("Forwarding data to target " << target << " at " << destination);
-                SendData(packet, destination, m_dataPort);
-                
-                m_packetsForwarded++;
-                m_bytesForwarded += packet->GetSize();
-                
-                // Fire trace
-                m_dataForwarded(packet->GetSize(), fromAddr.GetIpv4(), destination);
+
+                if (destination == Ipv4Address::GetZero())
+                {
+                    NS_LOG_DEBUG("Dropping packet for target " << target
+                                 << " because the forwarding entry is unresolved");
+                }
+                else
+                {
+                    NS_LOG_INFO("Forwarding data to target " << target << " at " << destination);
+                    SendData(packet, destination, m_dataPort);
+
+                    m_packetsForwarded++;
+                    m_bytesForwarded += packet->GetSize();
+
+                    // Fire trace
+                    m_dataForwarded(packet->GetSize(), fromAddr.GetIpv4(), destination);
+                }
             }
             else
             {
@@ -301,6 +344,7 @@ OranForwardingApp::ExecuteForwardingCommand(const std::string& command)
             {
                 m_forwardingTable.erase(it);
                 NS_LOG_INFO("Removed forwarding entry for target: " << target);
+                m_forwardingTableUpdated(target, Ipv4Address::GetZero());
             }
         }
         else
@@ -318,6 +362,12 @@ void
 OranForwardingApp::SendData(Ptr<Packet> data, const Ipv4Address& destination, uint16_t port)
 {
     NS_LOG_FUNCTION(this << data << destination << port);
+
+    if (destination == Ipv4Address::GetZero())
+    {
+        NS_LOG_DEBUG("Ignoring forwarding attempt to 0.0.0.0");
+        return;
+    }
 
     if (m_sendSocket)
     {
@@ -364,6 +414,7 @@ OranForwardingApp::UpdateForwardingTable(const std::string& target, const Ipv4Ad
 {
     NS_LOG_FUNCTION(this << target << destination);
     m_forwardingTable[target] = destination;
+    m_forwardingTableUpdated(target, destination);
 }
 
 std::map<std::string, Ipv4Address>

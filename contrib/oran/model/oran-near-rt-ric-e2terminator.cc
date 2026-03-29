@@ -80,7 +80,15 @@ OranNearRtRicE2Terminator::GetTypeId()
                           "delay for a command.",
                           StringValue("ns3::ConstantRandomVariable[Constant=0]"),
                           MakePointerAccessor(&OranNearRtRicE2Terminator::m_transmissionDelayRv),
-                          MakePointerChecker<RandomVariableStream>());
+                          MakePointerChecker<RandomVariableStream>())
+            .AddTraceSource("ReportReceived",
+                            "A report was received at the Near-RT RIC E2 terminator",
+                            MakeTraceSourceAccessor(&OranNearRtRicE2Terminator::m_reportReceived),
+                            "ns3::TracedCallback::Uint64StringUint32")
+            .AddTraceSource("CommandSent",
+                            "A command was sent from the Near-RT RIC E2 terminator",
+                            MakeTraceSourceAccessor(&OranNearRtRicE2Terminator::m_commandSent),
+                            "ns3::TracedCallback::Uint64StringUint32");
 
     return tid;
 }
@@ -177,9 +185,19 @@ OranNearRtRicE2Terminator::ReceiveDeregistrationRequest(uint64_t e2NodeId)
 
         uint64_t deregisteredE2NodeId = m_data->DeregisterNode(e2NodeId);
 
+        auto terminatorIt = m_nodeTerminators.find(e2NodeId);
+        if (terminatorIt == m_nodeTerminators.end() || terminatorIt->second == nullptr)
+        {
+            NS_LOG_WARN("Ignoring deregistration response for unknown E2 node " << e2NodeId);
+            return;
+        }
+
+        Ptr<OranE2NodeTerminator> terminator = terminatorIt->second;
+        m_nodeTerminators.erase(terminatorIt);
+
         Simulator::Schedule(Seconds(m_transmissionDelayRv->GetValue()),
                             &OranE2NodeTerminator::ReceiveDeregistrationResponse,
-                            m_nodeTerminators[e2NodeId],
+                            terminator,
                             deregisteredE2NodeId);
     }
 }
@@ -187,13 +205,18 @@ OranNearRtRicE2Terminator::ReceiveDeregistrationRequest(uint64_t e2NodeId)
 void
 OranNearRtRicE2Terminator::ReceiveReport(Ptr<OranReport> report)
 {
-    NS_LOG_FUNCTION(this << report->ToString());
+    std::string reportPayload = report->ToString();
+    NS_LOG_FUNCTION(this << reportPayload);
 
     if (m_active)
     {
         NS_ABORT_MSG_IF(
             m_data == nullptr,
             "Attempting to use a null data repository in the Near-RT RIC E2 Terminator");
+
+        m_reportReceived(report->GetReporterE2NodeId(),
+                         report->GetInstanceTypeId().GetName(),
+                         static_cast<uint32_t>(reportPayload.size()));
 
         if (report->GetInstanceTypeId() == TypeId::LookupByName("ns3::OranReportLocation"))
         {
@@ -240,7 +263,17 @@ OranNearRtRicE2Terminator::ReceiveReport(Ptr<OranReport> report)
 void
 OranNearRtRicE2Terminator::SendCommand(Ptr<OranCommand> command)
 {
-    NS_LOG_FUNCTION(this << command->ToString());
+    std::string commandPayload = command->ToString();
+    std::string commandLabel = command->GetTypeId().GetName();
+    if (commandPayload.rfind("FORWARD ", 0) == 0)
+    {
+        commandLabel = "FORWARD";
+    }
+    else if (commandPayload.rfind("REMOVE ", 0) == 0)
+    {
+        commandLabel = "REMOVE";
+    }
+    NS_LOG_FUNCTION(this << commandPayload);
 
     if (m_active)
     {
@@ -248,11 +281,21 @@ OranNearRtRicE2Terminator::SendCommand(Ptr<OranCommand> command)
             m_data == nullptr,
             "Attempting to use a null data repository in the Near-RT RIC E2 Terminator");
 
+        auto terminatorIt = m_nodeTerminators.find(command->GetTargetE2NodeId());
+        if (terminatorIt == m_nodeTerminators.end() || terminatorIt->second == nullptr)
+        {
+            NS_LOG_WARN("Dropping command for unknown E2 node " << command->GetTargetE2NodeId());
+            return;
+        }
+
         m_data->LogCommandE2Terminator(command);
+        m_commandSent(command->GetTargetE2NodeId(),
+                      commandLabel,
+                      static_cast<uint32_t>(commandPayload.size()));
 
         Simulator::Schedule(Seconds(m_transmissionDelayRv->GetValue()),
                             &OranE2NodeTerminator::ReceiveCommand,
-                            m_nodeTerminators[command->GetTargetE2NodeId()],
+                            terminatorIt->second,
                             command);
     }
 }

@@ -1,0 +1,16 @@
+slot_index,controller,stage,start_time_s,end_time_s,duration_ms
+0,non-rt-ric,non_rt_orchestration,4,4.02,20
+0,near-rt-ric-1,near_rt_orchestration,4.033,4.048,15
+0,near-rt-ric-1,routing_xapp,4.048,4.058,10
+0,near-rt-ric-2,near_rt_orchestration,4.033,4.048,15
+0,near-rt-ric-2,routing_xapp,4.048,4.058,10
+1,non-rt-ric,non_rt_orchestration,8,8.02,20
+1,near-rt-ric-1,near_rt_orchestration,8.034,8.049,15
+1,near-rt-ric-1,routing_xapp,8.049,8.059,10
+1,near-rt-ric-2,near_rt_orchestration,8.034,8.049,15
+1,near-rt-ric-2,routing_xapp,8.049,8.059,10
+2,non-rt-ric,non_rt_orchestration,12,12.02,20
+2,near-rt-ric-1,near_rt_orchestration,12.033,12.048,15
+2,near-rt-ric-1,routing_xapp,12.048,12.058,10
+2,near-rt-ric-2,near_rt_orchestration,12.033,12.048,15
+2,near-rt-ric-2,routing_xapp,12.048,12.058,10

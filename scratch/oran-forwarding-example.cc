@@ -1,21 +1,28 @@
 /*
  * O-RAN Forwarding Control System Simulation
- * 
+ *
  * This simulation implements a hierarchical O-RAN architecture with:
  * - 1 Non-RT RIC (global orchestrator)
- * - 2 Near-RT RICs (regional controllers) 
+ * - 2 Near-RT RICs (regional controllers)
  * - 3 O-DUs + 1 O-CU under each Near-RT RIC
  * - Proactive forwarding decisions based on shortest paths
+ *
+ * Scenario note:
+ * - The topology semantics are satellite-inspired (GEO-like Non-RT RIC,
+ *   MEO-like Near-RT RICs, lower-layer O-DUs/O-CUs).
+ * - Packet transport is intentionally abstracted through IP links
+ *   (PointToPoint/CSMA) with configured rate and delay; this example does not
+ *   implement a detailed satellite PHY/MAC stack.
  *
  * IP Address Planning:
  * - Non-RT RIC ↔ Near-RT RIC: 10.1.x.x network
  * - Cluster 1 internal: 10.10.x.x network
  * - Cluster 2 internal: 10.11.x.x network
  *
- * Communication Protocols:
- * - Control channel: UDP port 9999 (command transmission)
- * - Data channel: UDP port 8080 (data forwarding)  
- * - Report channel: periodic status reports
+ * Transport/Application Mapping:
+ * - Control channel: UDP port 9999 (abstract command transport)
+ * - Data channel: UDP port 8080 (forwarding traffic)
+ * - Report channel: slot-triggered / periodic logical reports
  */
 
 #include "ns3/applications-module.h"
@@ -27,9 +34,12 @@
 #include "ns3/point-to-point-module.h"
 #include "ns3/oran-module.h"
 
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <map>
@@ -69,20 +79,476 @@ static uint64_t g_du4ControlFlowBytesSinceLast = 0;
 // 7. DU3聚合流量（DU3→CU，包含DU2+DU3的聚合突发效应）
 static uint64_t g_du3AggregateFlowBytesSinceLast = 0;
 
+struct SlotMetrics
+{
+    uint32_t slotIndex{0};
+    double slotStart{0.0};
+    bool topologyChanged{false};
+    uint32_t controlRounds{0};
+    uint32_t a1Messages{0};
+    uint32_t o1Messages{0};
+    uint32_t e2Reports{0};
+    uint32_t e2Commands{0};
+    uint32_t a1SerializedBytes{0};
+    uint32_t o1SerializedBytes{0};
+    uint32_t e2ReportSerializedBytes{0};
+    uint32_t e2CommandSerializedBytes{0};
+    uint32_t totalControlSerializedBytes{0};
+    uint32_t forwardingUpdates{0};
+    double nonRtProcessingMs{0.0};
+    double nearRtProcessingMs{0.0};
+    double routingProcessingMs{0.0};
+    double controllerCriticalPathMs{0.0};
+};
+
+struct SlotRuntimeState
+{
+    uint32_t expectedReports{0};
+    uint32_t receivedReports{0};
+};
+
+struct ControllerStageSample
+{
+    uint32_t slotIndex{0};
+    std::string controller;
+    std::string stage;
+    double startTime{0.0};
+    double endTime{0.0};
+    double durationMs{0.0};
+};
+
+struct ReconfigurationEvent
+{
+    uint32_t eventId{0};
+    uint32_t slotIndex{0};
+    double triggerTime{0.0};
+    double o1CompletionTime{0.0};
+    double e2ReportCompletionTime{0.0};
+    double nearRtProcessingCompletionTime{0.0};
+    double e2CommandDispatchTime{0.0};
+    double forwardingUpdateCompletionTime{0.0};
+    double latencyMs{0.0};
+    uint32_t expectedForwardingUpdates{0};
+    uint32_t completedForwardingUpdates{0};
+    std::set<std::string> pendingNodes;
+    bool completed{false};
+};
+
+struct ThroughputSample
+{
+    double time{0.0};
+    double du2FlowMbps{0.0};
+    double du5FlowMbps{0.0};
+    double cluster1Mbps{0.0};
+    double cluster2Mbps{0.0};
+    double totalMbps{0.0};
+};
+
+struct ControlMessageSample
+{
+    uint32_t slotIndex{0};
+    double time{0.0};
+    std::string interfaceName;
+    std::string direction;
+    std::string source;
+    std::string destination;
+    std::string messageType;
+    uint32_t serializedBytes{0};
+};
+
+static double g_controlStartTime = 4.0;
+static double g_slotDuration = 4.0;
+static double g_nonRtProcessingDelay = 0.020;
+static double g_a1TransmissionDelay = 0.003;
+static double g_o1TransmissionDelay = 0.004;
+static double g_nearRtProcessingDelay = 0.015;
+static double g_routingProcessingDelay = 0.010;
+
+static std::map<uint32_t, SlotMetrics> g_slotMetrics;
+static std::map<uint32_t, SlotRuntimeState> g_slotRuntime;
+static std::map<uint32_t, std::function<void(void)>> g_slotReadyCallbacks;
+static std::vector<ControllerStageSample> g_controllerStages;
+static std::vector<ReconfigurationEvent> g_reconfigurationEvents;
+static int32_t g_activeReconfigurationEvent = -1;
+static std::vector<ThroughputSample> g_throughputSamples;
+static std::vector<ControlMessageSample> g_controlMessages;
+static std::map<std::string, Ipv4Address> g_lastAppliedNextHop;
+
+static int32_t GetControlSlotIndex(double timeSeconds)
+{
+    if (timeSeconds + 1e-9 < g_controlStartTime || g_slotDuration <= 0.0)
+    {
+        return -1;
+    }
+
+    return static_cast<int32_t>(std::floor((timeSeconds - g_controlStartTime + 1e-9) / g_slotDuration));
+}
+
+static SlotMetrics& GetOrCreateSlotMetrics(uint32_t slotIndex)
+{
+    auto it = g_slotMetrics.find(slotIndex);
+    if (it == g_slotMetrics.end())
+    {
+        SlotMetrics slot;
+        slot.slotIndex = slotIndex;
+        slot.slotStart = g_controlStartTime + slotIndex * g_slotDuration;
+        slot.controllerCriticalPathMs =
+            (g_nonRtProcessingDelay + g_nearRtProcessingDelay + g_routingProcessingDelay) * 1000.0;
+        it = g_slotMetrics.emplace(slotIndex, slot).first;
+    }
+
+    return it->second;
+}
+
+static void RecordControllerStage(uint32_t slotIndex,
+                                  const std::string& controller,
+                                  const std::string& stage,
+                                  double startTime,
+                                  double durationSeconds)
+{
+    ControllerStageSample sample;
+    sample.slotIndex = slotIndex;
+    sample.controller = controller;
+    sample.stage = stage;
+    sample.startTime = startTime;
+    sample.endTime = startTime + durationSeconds;
+    sample.durationMs = durationSeconds * 1000.0;
+    g_controllerStages.push_back(sample);
+
+    SlotMetrics& slot = GetOrCreateSlotMetrics(slotIndex);
+    if (stage == "non_rt_orchestration")
+    {
+        slot.nonRtProcessingMs += sample.durationMs;
+    }
+    else if (stage == "near_rt_orchestration")
+    {
+        slot.nearRtProcessingMs += sample.durationMs;
+    }
+    else if (stage == "routing_xapp")
+    {
+        slot.routingProcessingMs += sample.durationMs;
+    }
+}
+
+static void RecordControlMessage(uint32_t slotIndex,
+                                 double timeSeconds,
+                                 const std::string& interfaceName,
+                                 const std::string& direction,
+                                 const std::string& source,
+                                 const std::string& destination,
+                                 const std::string& messageType,
+                                 uint32_t serializedBytes)
+{
+    ControlMessageSample sample;
+    sample.slotIndex = slotIndex;
+    sample.time = timeSeconds;
+    sample.interfaceName = interfaceName;
+    sample.direction = direction;
+    sample.source = source;
+    sample.destination = destination;
+    sample.messageType = messageType;
+    sample.serializedBytes = serializedBytes;
+    g_controlMessages.push_back(sample);
+
+    SlotMetrics& slot = GetOrCreateSlotMetrics(slotIndex);
+    if (interfaceName == "A1")
+    {
+        slot.a1Messages++;
+        slot.a1SerializedBytes += serializedBytes;
+    }
+    else if (interfaceName == "O1")
+    {
+        slot.o1Messages++;
+        slot.o1SerializedBytes += serializedBytes;
+    }
+    else if (interfaceName == "E2")
+    {
+        if (direction == "uplink")
+        {
+            slot.e2Reports++;
+            slot.e2ReportSerializedBytes += serializedBytes;
+        }
+        else if (direction == "downlink")
+        {
+            slot.e2Commands++;
+            slot.e2CommandSerializedBytes += serializedBytes;
+        }
+    }
+
+    slot.totalControlSerializedBytes = slot.a1SerializedBytes + slot.o1SerializedBytes +
+                                       slot.e2ReportSerializedBytes +
+                                       slot.e2CommandSerializedBytes;
+}
+
+static std::string BuildA1PolicyPayload(uint32_t slotIndex,
+                                        const std::string& targetRicLabel,
+                                        bool topologyChanged)
+{
+    std::ostringstream oss;
+    oss << "A1PolicyUpdate{slot=" << slotIndex << ";target=" << targetRicLabel
+        << ";topologyChanged=" << (topologyChanged ? 1 : 0)
+        << ";policy=forwarding_slot_update}";
+    return oss.str();
+}
+
+static std::string BuildO1ReassignmentPayload(uint32_t slotIndex,
+                                              const std::string& nodeLabel,
+                                              const std::string& targetRicLabel)
+{
+    std::ostringstream oss;
+    oss << "O1CZReassignment{slot=" << slotIndex << ";node=" << nodeLabel
+        << ";targetNearRtRic=" << targetRicLabel
+        << ";action=refresh_registration}";
+    return oss.str();
+}
+
+static void OnE2ReportReceived(std::string ricLabel,
+                               uint64_t reporterE2NodeId,
+                               std::string reportType,
+                               uint32_t serializedBytes)
+{
+    double now = Simulator::Now().GetSeconds();
+    int32_t slotIndex = GetControlSlotIndex(now);
+    if (slotIndex < 0)
+    {
+        return;
+    }
+
+    RecordControlMessage(static_cast<uint32_t>(slotIndex),
+                         now,
+                         "E2",
+                         "uplink",
+                         "E2Node-" + std::to_string(reporterE2NodeId),
+                         ricLabel,
+                         reportType,
+                         serializedBytes);
+
+    auto runtimeIt = g_slotRuntime.find(static_cast<uint32_t>(slotIndex));
+    if (runtimeIt == g_slotRuntime.end())
+    {
+        return;
+    }
+
+    runtimeIt->second.receivedReports++;
+    if (runtimeIt->second.receivedReports >= runtimeIt->second.expectedReports)
+    {
+        if (g_activeReconfigurationEvent >= 0)
+        {
+            ReconfigurationEvent& event = g_reconfigurationEvents[g_activeReconfigurationEvent];
+            if (event.slotIndex == static_cast<uint32_t>(slotIndex) &&
+                event.e2ReportCompletionTime <= 0.0)
+            {
+                event.e2ReportCompletionTime = now;
+            }
+        }
+
+        auto cbIt = g_slotReadyCallbacks.find(static_cast<uint32_t>(slotIndex));
+        if (cbIt != g_slotReadyCallbacks.end())
+        {
+            auto callback = cbIt->second;
+            g_slotReadyCallbacks.erase(cbIt);
+            callback();
+        }
+    }
+
+    NS_LOG_DEBUG("E2 report received from E2 node " << reporterE2NodeId << " type=" << reportType
+                 << " bytes=" << serializedBytes);
+}
+
+static void OnE2CommandSent(std::string ricLabel,
+                            uint64_t targetE2NodeId,
+                            std::string commandType,
+                            uint32_t serializedBytes)
+{
+    double now = Simulator::Now().GetSeconds();
+    int32_t slotIndex = GetControlSlotIndex(now);
+    if (slotIndex >= 0)
+    {
+        RecordControlMessage(static_cast<uint32_t>(slotIndex),
+                             now,
+                             "E2",
+                             "downlink",
+                             ricLabel,
+                             "E2Node-" + std::to_string(targetE2NodeId),
+                             commandType,
+                             serializedBytes);
+    }
+
+    NS_LOG_DEBUG("E2 command sent to E2 node " << targetE2NodeId << " type=" << commandType
+                 << " bytes=" << serializedBytes);
+}
+
+static void OnForwardingTableUpdated(std::string nodeLabel,
+                                     std::string target,
+                                     Ipv4Address destination)
+{
+    double now = Simulator::Now().GetSeconds();
+    g_lastAppliedNextHop[nodeLabel] = destination;
+
+    if (destination != Ipv4Address::GetZero())
+    {
+        int32_t slotIndex = GetControlSlotIndex(now);
+        if (slotIndex >= 0)
+        {
+            GetOrCreateSlotMetrics(static_cast<uint32_t>(slotIndex)).forwardingUpdates++;
+        }
+
+        if (g_activeReconfigurationEvent >= 0)
+        {
+            ReconfigurationEvent& event = g_reconfigurationEvents[g_activeReconfigurationEvent];
+            if (event.pendingNodes.erase(nodeLabel) > 0)
+            {
+                event.completedForwardingUpdates++;
+                if (event.pendingNodes.empty())
+                {
+                    event.forwardingUpdateCompletionTime = now;
+                    event.latencyMs = (now - event.triggerTime) * 1000.0;
+                    event.completed = true;
+                    g_activeReconfigurationEvent = -1;
+                }
+            }
+        }
+    }
+
+    NS_LOG_DEBUG("Forwarding table updated on " << nodeLabel << ": " << target << " -> " << destination);
+}
+
+static void WriteControlOverheadCsv(const std::string& fileName)
+{
+    std::ofstream csv(fileName);
+    csv << "slot_index,slot_start_s,topology_changed,control_rounds,a1_messages,o1_messages,"
+           "e2_reports,e2_commands,a1_serialized_bytes,o1_serialized_bytes,"
+           "e2_report_serialized_bytes,e2_command_serialized_bytes,total_control_serialized_bytes,"
+           "forwarding_updates,non_rt_processing_ms,"
+           "near_rt_processing_ms,routing_processing_ms,controller_critical_path_ms\n";
+
+    for (const auto& entry : g_slotMetrics)
+    {
+        const SlotMetrics& slot = entry.second;
+        csv << slot.slotIndex << "," << slot.slotStart << "," << (slot.topologyChanged ? 1 : 0)
+            << "," << slot.controlRounds << "," << slot.a1Messages << "," << slot.o1Messages
+            << "," << slot.e2Reports << "," << slot.e2Commands << ","
+            << slot.a1SerializedBytes << "," << slot.o1SerializedBytes << ","
+            << slot.e2ReportSerializedBytes << "," << slot.e2CommandSerializedBytes << ","
+            << slot.totalControlSerializedBytes << "," << slot.forwardingUpdates << ","
+            << slot.nonRtProcessingMs << "," << slot.nearRtProcessingMs << ","
+            << slot.routingProcessingMs << "," << slot.controllerCriticalPathMs << "\n";
+    }
+}
+
+static void WriteControlMessageCsv(const std::string& fileName)
+{
+    std::ofstream csv(fileName);
+    csv << "slot_index,time_s,interface,direction,source,destination,message_type,"
+           "serialized_bytes\n";
+
+    for (const auto& sample : g_controlMessages)
+    {
+        csv << sample.slotIndex << "," << sample.time << "," << sample.interfaceName << ","
+            << sample.direction << "," << sample.source << "," << sample.destination << ","
+            << sample.messageType << "," << sample.serializedBytes << "\n";
+    }
+}
+
+static void WriteControllerProcessingCsv(const std::string& fileName)
+{
+    std::ofstream csv(fileName);
+    csv << "slot_index,controller,stage,start_time_s,end_time_s,duration_ms\n";
+
+    for (const auto& sample : g_controllerStages)
+    {
+        csv << sample.slotIndex << "," << sample.controller << "," << sample.stage << ","
+            << sample.startTime << "," << sample.endTime << "," << sample.durationMs << "\n";
+    }
+}
+
+static void WriteReconfigurationLatencyCsv(const std::string& fileName)
+{
+    std::ofstream csv(fileName);
+    csv << "event_id,slot_index,trigger_time_s,o1_completion_time_s,e2_report_completion_time_s,"
+           "near_rt_processing_completion_time_s,e2_command_dispatch_time_s,"
+           "forwarding_update_completion_time_s,reconfiguration_latency_ms,"
+           "expected_forwarding_updates,completed_forwarding_updates\n";
+
+    for (const auto& event : g_reconfigurationEvents)
+    {
+        csv << event.eventId << "," << event.slotIndex << "," << event.triggerTime << ","
+            << event.o1CompletionTime << "," << event.e2ReportCompletionTime << ","
+            << event.nearRtProcessingCompletionTime << "," << event.e2CommandDispatchTime << ","
+            << event.forwardingUpdateCompletionTime << "," << event.latencyMs << ","
+            << event.expectedForwardingUpdates << "," << event.completedForwardingUpdates << "\n";
+    }
+}
+
+static void WriteTransientThroughputImpactCsv(const std::string& fileName)
+{
+    std::ofstream csv(fileName);
+    csv << "event_id,baseline_total_mbps,min_total_mbps,throughput_drop_mbps,throughput_drop_pct,"
+           "min_time_s,recovery_time_s,recovery_latency_ms\n";
+
+    for (const auto& event : g_reconfigurationEvents)
+    {
+        double baselineStart = std::max(g_controlStartTime, event.triggerTime - 1.0);
+        double baselineEnd = event.triggerTime;
+        double minWindowEnd = event.forwardingUpdateCompletionTime > 0.0
+                                  ? event.forwardingUpdateCompletionTime + 1.0
+                                  : event.triggerTime + 1.0;
+
+        double baselineSum = 0.0;
+        uint32_t baselineCount = 0;
+        double minTotal = std::numeric_limits<double>::infinity();
+        double minTime = -1.0;
+
+        for (const auto& sample : g_throughputSamples)
+        {
+            if (sample.time >= baselineStart && sample.time < baselineEnd)
+            {
+                baselineSum += sample.totalMbps;
+                baselineCount++;
+            }
+
+            if (sample.time >= event.triggerTime && sample.time <= minWindowEnd &&
+                sample.totalMbps < minTotal)
+            {
+                minTotal = sample.totalMbps;
+                minTime = sample.time;
+            }
+        }
+
+        double baseline = baselineCount > 0 ? baselineSum / baselineCount : 0.0;
+        if (!std::isfinite(minTotal))
+        {
+            minTotal = baseline;
+        }
+
+        double drop = std::max(0.0, baseline - minTotal);
+        double dropPct = baseline > 0.0 ? (drop / baseline) * 100.0 : 0.0;
+        double recoveryThreshold = baseline * 0.95;
+        double recoveryTime = -1.0;
+        double recoverySearchStart = minTime >= 0.0 ? minTime : event.triggerTime;
+
+        for (const auto& sample : g_throughputSamples)
+        {
+            if (sample.time > recoverySearchStart && sample.totalMbps >= recoveryThreshold)
+            {
+                recoveryTime = sample.time;
+                break;
+            }
+        }
+
+        double recoveryLatencyMs =
+            recoveryTime >= 0.0 ? (recoveryTime - event.triggerTime) * 1000.0 : -1.0;
+
+        csv << event.eventId << "," << baseline << "," << minTotal << "," << drop << ","
+            << dropPct << "," << minTime << "," << recoveryTime << "," << recoveryLatencyMs
+            << "\n";
+    }
+}
+
 // 去重机制：记录已统计的数据包，避免重复统计
 static std::set<std::string> g_processedPackets;
 // 基于CALL#的去重：记录 时间窗口 + CALL# + src-dst 组合
 static std::map<std::string, double> g_callBasedDedup;
-
-// 生成数据包唯一标识符 - 使用更粗粒度的时间戳避免过度去重
-static std::string GeneratePacketId(uint32_t size, Ipv4Address src, Ipv4Address dst, double timestamp)
-{
-    std::ostringstream oss;
-    // 更精确的去重：使用微秒级时间戳 + 流标识
-    uint64_t timestampUs = static_cast<uint64_t>(timestamp * 1000000);
-    oss << timestampUs << "_" << src << "_" << dst << "_" << size;
-    return oss.str();
-}
 
 // 调试计数器：统计每个src-dst对的调用次数
 static std::map<std::string, int> g_callCounter;
@@ -90,13 +556,7 @@ static std::map<std::string, int> g_callCounter;
 // DU2发送事件回调函数（现在仅用于调试，不统计流量）
 static void OnDu2TxEvent(Ptr<const Packet> packet)
 {
-    double now = Simulator::Now().GetSeconds();
-    uint32_t size = packet->GetSize();
-    // g_du2FlowBytesSinceLast += size;  // 注释掉，改为在OnDataForwarded中统计
-    if (now >= 7.8 && now <= 8.5) {
-        NS_LOG_UNCOND("DU2_TX_LOG t=" << std::fixed << std::setprecision(3) << now 
-                     << "s: DU2 sent " << size << " bytes (app layer)");
-    }
+    (void)packet;
 }
 
 // 回调：所有 OranForwardingApp 转发时触发
@@ -128,19 +588,6 @@ static void OnDataForwarded(uint32_t size, Ipv4Address src, Ipv4Address dst)
     }
     g_callBasedDedup[exactDupKey] = now;
     
-    // 🔍 统计验证 - 每次Cluster1统计时记录详细信息
-    if (now >= 7.45 && now <= 7.46 && dst == g_cu1Addr) {
-        NS_LOG_UNCOND("CLUSTER1_STAT t=" << std::fixed << std::setprecision(3) << now 
-                     << "s: +1024 bytes SRC=" << src << " DST=" << dst 
-                     << " [Total so far: " << (g_cluster1TotalBytesSinceLast + size) << " bytes]");
-    }
-    
-    // 🔍 详细移动监控日志 - 监控8秒前后的流量变化
-    if (now >= 7.8 && now <= 8.5) {
-        NS_LOG_UNCOND("MOBILITY_LOG t=" << std::fixed << std::setprecision(3) << now 
-                     << "s: " << size << " bytes " << src << " → " << dst << " [CALL#" << g_callCounter[flowKey] << "]");
-    }
-    
     // 1. 集群总吞吐量统计 - 在关键转发节点统计
     if (dst == g_cu1Addr)
     {
@@ -157,13 +604,6 @@ static void OnDataForwarded(uint32_t size, Ipv4Address src, Ipv4Address dst)
     if (src == g_du2Addr && (dst == g_cu1Addr || dst == g_cu2Addr)) {
         // 统计DU2的端到端流量（移动前到CU1，移动后到CU2）
         g_du2FlowBytesSinceLast += size;
-        
-        // 调试：检查DU2流量的详细信息
-        if (now >= 6.5 && now <= 7.0) {
-            NS_LOG_UNCOND("DU2_DETAILED t=" << std::fixed << std::setprecision(3) << now 
-                         << "s: DU2 packet size=" << size 
-                         << " bytes, src=" << src << " dst=" << dst);
-        }
     }
     
     // 3. DU5流量统计 - 在转发节点统计来自DU5的流量  
@@ -201,7 +641,7 @@ int main(int argc, char* argv[])
 {
     // 启用日志
     LogComponentEnable("OranForwardingExample", LOG_LEVEL_INFO);
-    LogComponentEnable("OranForwardingApp", LOG_LEVEL_INFO);
+    LogComponentEnable("OranForwardingApp", LOG_LEVEL_ERROR);
     // LogComponentEnable("OranForwardingApp", LOG_LEVEL_DEBUG);
     // 设置原始转发逻辑模块为ERROR级别，隐藏内部虚拟节点的注册信息
     LogComponentEnable("OranLmForwarding", LOG_LEVEL_ERROR);
@@ -213,20 +653,74 @@ int main(int argc, char* argv[])
     double simulationTime = 15.0; // seconds
     bool enableTracing = true;
     uint32_t packetSize = 1024;
-    std::string dataRate1 = "20Mbps"; // for CSMA1
-    std::string dataRate2 = "20Mbps"; // for CSMA2
+    std::string dataRate1 = "20Mbps"; // abstract cluster-1 transport segment
+    std::string dataRate2 = "20Mbps"; // abstract cluster-2 transport segment
     double swapTime = 8.0; // 在此时刻进行 DU2/DU3 与 DU5/DU6 的位置与RIC切换（需小于simulationTime）
+    double controlStartTime = 4.0;
+    double slotDuration = 4.0;
+    double nonRtProcessingDelay = 0.020;
+    double a1TransmissionDelay = 0.003;
+    double o1TransmissionDelay = 0.004;
+    double nearRtProcessingDelay = 0.015;
+    double routingProcessingDelay = 0.010;
+    double e2ReportTransmissionDelay = 0.010;
+    double e2CommandTransmissionDelay = 0.001;
+    double commandProcessingDelay = 0.002;
     
     CommandLine cmd(__FILE__);
     cmd.AddValue("simulationTime", "Simulation time in seconds", simulationTime);
     cmd.AddValue("enableTracing", "Enable pcap tracing", enableTracing);
     cmd.AddValue("packetSize", "Size of data packets", packetSize);
     cmd.AddValue("swapTime", "Time to swap DU2<->DU5 and DU3<->DU6 positions and RIC (seconds)", swapTime);
+    cmd.AddValue("controlStartTime", "Time to start slot-level control orchestration", controlStartTime);
+    cmd.AddValue("slotDuration", "Slot duration for control-plane orchestration", slotDuration);
+    cmd.AddValue("nonRtProcessingDelay", "Non-RT RIC orchestration delay in seconds", nonRtProcessingDelay);
+    cmd.AddValue("a1TransmissionDelay", "A1 transmission delay in seconds", a1TransmissionDelay);
+    cmd.AddValue("o1TransmissionDelay", "O1 transmission delay in seconds", o1TransmissionDelay);
+    cmd.AddValue("nearRtProcessingDelay", "Near-RT orchestration delay in seconds", nearRtProcessingDelay);
+    cmd.AddValue("routingProcessingDelay", "Routing xApp delay in seconds", routingProcessingDelay);
+    cmd.AddValue("e2ReportTransmissionDelay",
+                 "E2 report transmission delay in seconds",
+                 e2ReportTransmissionDelay);
+    cmd.AddValue("e2CommandTransmissionDelay",
+                 "E2 command transmission delay in seconds",
+                 e2CommandTransmissionDelay);
+    cmd.AddValue("commandProcessingDelay",
+                 "Forwarding-table application delay in seconds",
+                 commandProcessingDelay);
     cmd.Parse(argc, argv);
     g_swapTime = swapTime; // 传递给统计回调
+    g_controlStartTime = controlStartTime;
+    g_slotDuration = slotDuration;
+    g_nonRtProcessingDelay = nonRtProcessingDelay;
+    g_a1TransmissionDelay = a1TransmissionDelay;
+    g_o1TransmissionDelay = o1TransmissionDelay;
+    g_nearRtProcessingDelay = nearRtProcessingDelay;
+    g_routingProcessingDelay = routingProcessingDelay;
+
+    g_slotMetrics.clear();
+    g_slotRuntime.clear();
+    g_slotReadyCallbacks.clear();
+    g_controllerStages.clear();
+    g_reconfigurationEvents.clear();
+    g_activeReconfigurationEvent = -1;
+    g_throughputSamples.clear();
+    g_controlMessages.clear();
+    g_lastAppliedNextHop.clear();
     
     NS_LOG_INFO("=== O-RAN Forwarding Control System Simulation ===");
     NS_LOG_INFO("Simulation time: " << simulationTime << " seconds");
+
+    auto constantRv = [](double value) {
+        std::ostringstream oss;
+        oss << "ns3::ConstantRandomVariable[Constant=" << value << "]";
+        return oss.str();
+    };
+
+    const std::string commandProcessingDelayRv = constantRv(commandProcessingDelay);
+    const std::string e2ReportDelayRv = constantRv(e2ReportTransmissionDelay);
+    const std::string e2CommandDelayRv = constantRv(e2CommandTransmissionDelay);
+    const std::string dormantIntervalRv = constantRv(1000.0);
     
     //
     // 1. CREATE NODES
@@ -262,20 +756,20 @@ int main(int argc, char* argv[])
     //
     // 2. CONFIGURE NETWORK DEVICES AND LINKS
     //
-    NS_LOG_INFO("Setting up network links...");
-    
-    // Point-to-Point link configuration for backbone
+    NS_LOG_INFO("Setting up abstract IP transport segments...");
+
+    // Abstract inter-RIC transport segment
     PointToPointHelper p2p;
     p2p.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
     p2p.SetChannelAttribute("Delay", StringValue("2ms"));
     
-    // CSMA configuration for clusters (simulating local area networks)
-    // 为每个Cluster创建独立的CSMA信道，避免共享带宽
-    CsmaHelper csma1;  // Cluster1独立信道
+    // Abstract per-cluster transport segments.
+    // 为每个 Cluster 创建独立信道，避免共享带宽并保持路径可解释性。
+    CsmaHelper csma1;  // Cluster 1 的抽象接入段
     csma1.SetChannelAttribute("DataRate", StringValue(dataRate1));
     csma1.SetChannelAttribute("Delay", TimeValue(NanoSeconds(6560)));
     
-    CsmaHelper csma2;  // Cluster2独立信道
+    CsmaHelper csma2;  // Cluster 2 的抽象接入段
     csma2.SetChannelAttribute("DataRate", StringValue(dataRate2));
     csma2.SetChannelAttribute("Delay", TimeValue(NanoSeconds(6560)));
 
@@ -290,13 +784,13 @@ int main(int argc, char* argv[])
     nonRtToNear2.Add(nearRtRic2);
     NetDeviceContainer nonRtToNear2Devices = p2p.Install(nonRtToNear2);
 
-    // Connect Near-RT RIC 1 to Cluster 1 nodes (10.10.x.x network)
+    // Connect Near-RT RIC 1 to the cluster-1 abstract transport segment
     NodeContainer cluster1Network;
     cluster1Network.Add(nearRtRic1);
     cluster1Network.Add(cluster1Nodes);
     NetDeviceContainer cluster1Devices = csma1.Install(cluster1Network);  // 使用独立的csma1
 
-    // Connect Near-RT RIC 2 to Cluster 2 nodes (10.11.x.x network)  
+    // Connect Near-RT RIC 2 to the cluster-2 abstract transport segment
     NodeContainer cluster2Network;
     cluster2Network.Add(nearRtRic2);
     cluster2Network.Add(cluster2Nodes);
@@ -340,16 +834,16 @@ int main(int argc, char* argv[])
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
     
     //
-    // 5. SET UP NODE POSITIONS (for satellite constellation topology)
+    // 5. SET UP NODE POSITIONS (satellite-inspired topology semantics)
     //
-    NS_LOG_INFO("Setting up satellite constellation positions...");
-    
+    NS_LOG_INFO("Setting up satellite-inspired node positions...");
+
     MobilityHelper mobility;
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
 
-    // Non-RT RIC at GEO orbit (highest layer)
+    // Non-RT RIC at a logical GEO-like position
     Ptr<ListPositionAllocator> nonRtPositions = CreateObject<ListPositionAllocator>();
-    nonRtPositions->Add(Vector(0.0, 0.0, 1000.0));  // GEO satellite
+    nonRtPositions->Add(Vector(0.0, 0.0, 1000.0));
     mobility.SetPositionAllocator(nonRtPositions);
     mobility.Install(nonRtRic);
     
@@ -357,10 +851,10 @@ int main(int argc, char* argv[])
     Vector nonRtPos = nonRtMobility->GetPosition();
     NS_LOG_INFO("Non-RT RIC 设置的位置: (" << nonRtPos.x << ", " << nonRtPos.y << ", " << nonRtPos.z << ")");
 
-    // Near-RT RIC at MEO orbit (middle layer)
+    // Near-RT RICs at logical MEO-like positions
     Ptr<ListPositionAllocator> nearRtPositions = CreateObject<ListPositionAllocator>();
-    nearRtPositions->Add(Vector(-200.0, 0.0, 500.0));  // MEO satellite for cluster 1
-    nearRtPositions->Add(Vector(200.0, 0.0, 500.0));   // MEO satellite for cluster 2
+    nearRtPositions->Add(Vector(-200.0, 0.0, 500.0));  // cluster 1 controller
+    nearRtPositions->Add(Vector(200.0, 0.0, 500.0));   // cluster 2 controller
     mobility.SetPositionAllocator(nearRtPositions);
     mobility.Install(nearRtRic1);
     mobility.Install(nearRtRic2);
@@ -373,21 +867,21 @@ int main(int argc, char* argv[])
     Vector nearRt2Pos = nearRt2Mobility->GetPosition();
     NS_LOG_INFO("Near-RT RIC 2 设置的位置: (" << nearRt2Pos.x << ", " << nearRt2Pos.y << ", " << nearRt2Pos.z << ")");
 
-    // Cluster 1: 3 DUs + 1 CU forming a grid/square at LEO orbit
+    // Cluster 1: lower-layer logical positions for 3 DUs + 1 CU
     Ptr<ListPositionAllocator> cluster1Positions = CreateObject<ListPositionAllocator>();
-    cluster1Positions->Add(Vector(-250.0, -50.0, 100.0));  // DU-1 (top-left)
-    cluster1Positions->Add(Vector(-250.0, 50.0, 100.0));   // DU-2 (bottom-left)
-    cluster1Positions->Add(Vector(-150.0, 50.0, 100.0));   // DU-3 (bottom-right)
-    cluster1Positions->Add(Vector(-150.0, -50.0, 100.0));  // CU-1 (top-right)
+    cluster1Positions->Add(Vector(-250.0, -50.0, 100.0));  // DU-1
+    cluster1Positions->Add(Vector(-250.0, 50.0, 100.0));   // DU-2
+    cluster1Positions->Add(Vector(-150.0, 50.0, 100.0));   // DU-3
+    cluster1Positions->Add(Vector(-150.0, -50.0, 100.0));  // CU-1
     mobility.SetPositionAllocator(cluster1Positions);
     mobility.Install(cluster1Nodes);
 
-    // Cluster 2: 3 DUs + 1 CU forming a grid/square at LEO orbit  
+    // Cluster 2: lower-layer logical positions for 3 DUs + 1 CU
     Ptr<ListPositionAllocator> cluster2Positions = CreateObject<ListPositionAllocator>();
-    cluster2Positions->Add(Vector(150.0, -50.0, 100.0));   // DU-4 (top-left)
-    cluster2Positions->Add(Vector(150.0, 50.0, 100.0));    // DU-5 (bottom-left)
-    cluster2Positions->Add(Vector(250.0, 50.0, 100.0));    // DU-6 (bottom-right)
-    cluster2Positions->Add(Vector(250.0, -50.0, 100.0));   // CU-2 (top-right)
+    cluster2Positions->Add(Vector(150.0, -50.0, 100.0));   // DU-4
+    cluster2Positions->Add(Vector(150.0, 50.0, 100.0));    // DU-5
+    cluster2Positions->Add(Vector(250.0, 50.0, 100.0));    // DU-6
+    cluster2Positions->Add(Vector(250.0, -50.0, 100.0));   // CU-2
     mobility.SetPositionAllocator(cluster2Positions);
     mobility.Install(cluster2Nodes);
 
@@ -399,8 +893,8 @@ int main(int argc, char* argv[])
     // Install forwarding applications on all O-DU and O-CU nodes
     ApplicationContainer forwardingApps;
 
-    // Cluster 1 nodes  
-    // 保存每个节点的转发应用指针，便于手动下发表项
+    // Cluster 1 nodes
+    // 保存每个节点的转发应用指针，便于挂接 trace 与实验逻辑
     std::vector<Ptr<OranForwardingApp>> appC1(cluster1Nodes.GetN());
     std::vector<Ptr<OranForwardingApp>> appC2(cluster2Nodes.GetN());
 
@@ -415,6 +909,7 @@ int main(int argc, char* argv[])
         app->SetAttribute("Port", UintegerValue(9999));
         // 关键：统一所有节点的数据端口，便于应用层转发链路收敛
         app->SetAttribute("DataPort", UintegerValue(8080));
+        app->SetAttribute("CommandProcessingDelayRv", StringValue(commandProcessingDelayRv));
         cluster1Nodes.Get(i)->AddApplication(app);
         app->SetStartTime(Seconds(1.0));
         app->SetStopTime(Seconds(simulationTime));
@@ -433,6 +928,7 @@ int main(int argc, char* argv[])
         }
         app->SetAttribute("Port", UintegerValue(9999));
         app->SetAttribute("DataPort", UintegerValue(8080));
+        app->SetAttribute("CommandProcessingDelayRv", StringValue(commandProcessingDelayRv));
         cluster2Nodes.Get(i)->AddApplication(app);
         app->SetStartTime(Seconds(1.0));
         app->SetStopTime(Seconds(simulationTime));
@@ -473,7 +969,7 @@ int main(int argc, char* argv[])
 
     nearRtRicE2Terminator1->SetAttribute("NearRtRic", PointerValue(nearRtRic1App));
     nearRtRicE2Terminator1->SetAttribute("DataRepository", PointerValue(dataRepository));
-    nearRtRicE2Terminator1->SetAttribute("TransmissionDelayRv", StringValue("ns3::ConstantRandomVariable[Constant=0.001]"));
+    nearRtRicE2Terminator1->SetAttribute("TransmissionDelayRv", StringValue(e2CommandDelayRv));
 
     nearRtRic1App->SetAttribute("DefaultLogicModule", PointerValue(forwardingLm1));
     nearRtRic1App->SetAttribute("E2Terminator", PointerValue(nearRtRicE2Terminator1));
@@ -481,8 +977,10 @@ int main(int argc, char* argv[])
     // 为避免已知LM在早期周期触发崩溃，将查询周期设为超大，转发表改为脚本手动配置
     nearRtRic1App->SetAttribute("LmQueryInterval", TimeValue(Seconds(1000)));  // 不在仿真时长内触发
     nearRtRic1App->SetAttribute("ConflictMitigationModule", PointerValue(cmm1));
-    nearRtRic1App->SetAttribute("E2NodeInactivityThreshold", TimeValue(Seconds(5)));
-    nearRtRic1App->SetAttribute("E2NodeInactivityIntervalRv", StringValue("ns3::ConstantRandomVariable[Constant=5]"));
+    // Keep the stock inactivity checker dormant; it is registration-based and
+    // would otherwise add timeout artifacts unrelated to this slot-driven study.
+    nearRtRic1App->SetAttribute("E2NodeInactivityThreshold", TimeValue(Seconds(1000)));
+    nearRtRic1App->SetAttribute("E2NodeInactivityIntervalRv", StringValue(dormantIntervalRv));
     nearRtRic1App->SetAttribute("LmQueryMaxWaitTime", TimeValue(Seconds(1)));
     nearRtRic1App->SetAttribute("LmQueryLateCommandPolicy", EnumValue(OranNearRtRic::DROP));
 
@@ -494,15 +992,15 @@ int main(int argc, char* argv[])
 
     nearRtRicE2Terminator2->SetAttribute("NearRtRic", PointerValue(nearRtRic2App));
     nearRtRicE2Terminator2->SetAttribute("DataRepository", PointerValue(dataRepository));
-    nearRtRicE2Terminator2->SetAttribute("TransmissionDelayRv", StringValue("ns3::ConstantRandomVariable[Constant=0.001]"));
+    nearRtRicE2Terminator2->SetAttribute("TransmissionDelayRv", StringValue(e2CommandDelayRv));
 
     nearRtRic2App->SetAttribute("DefaultLogicModule", PointerValue(forwardingLm2));
     nearRtRic2App->SetAttribute("E2Terminator", PointerValue(nearRtRicE2Terminator2));
     nearRtRic2App->SetAttribute("DataRepository", PointerValue(dataRepository));
     nearRtRic2App->SetAttribute("LmQueryInterval", TimeValue(Seconds(1000)));  // 不在仿真时长内触发
     nearRtRic2App->SetAttribute("ConflictMitigationModule", PointerValue(cmm2));
-    nearRtRic2App->SetAttribute("E2NodeInactivityThreshold", TimeValue(Seconds(5)));
-    nearRtRic2App->SetAttribute("E2NodeInactivityIntervalRv", StringValue("ns3::ConstantRandomVariable[Constant=5]"));
+    nearRtRic2App->SetAttribute("E2NodeInactivityThreshold", TimeValue(Seconds(1000)));
+    nearRtRic2App->SetAttribute("E2NodeInactivityIntervalRv", StringValue(dormantIntervalRv));
     nearRtRic2App->SetAttribute("LmQueryMaxWaitTime", TimeValue(Seconds(1)));
     nearRtRic2App->SetAttribute("LmQueryLateCommandPolicy", EnumValue(OranNearRtRic::DROP));
 
@@ -519,7 +1017,7 @@ int main(int argc, char* argv[])
     //
     NS_LOG_INFO("Deploying E2 Node Terminators...");
 
-    // 记录每个节点的 E2 Terminator 指针，便于运行时切换其 Near-RT RIC 与上报间隔
+    // 记录每个节点的 E2 Terminator 指针，便于运行时切换其 Near-RT RIC 归属
     std::vector<Ptr<OranE2NodeTerminatorWired>> e2TermC1(cluster1Nodes.GetN());
     std::vector<Ptr<OranE2NodeTerminatorWired>> e2TermC2(cluster2Nodes.GetN());
 
@@ -527,16 +1025,18 @@ int main(int argc, char* argv[])
     for (uint32_t i = 0; i < cluster1Nodes.GetN(); ++i)
     {
         Ptr<OranReporterLocation> locationReporter = CreateObject<OranReporterLocation>();
+        Ptr<OranReportTriggerPeriodic> locationTrigger = CreateObject<OranReportTriggerPeriodic>();
         Ptr<OranE2NodeTerminatorWired> e2Terminator = CreateObject<OranE2NodeTerminatorWired>();
 
-        // Configure location reporter（不显式设置Trigger，使用默认的Periodic触发器）
+        locationTrigger->SetAttribute("IntervalRv", StringValue(dormantIntervalRv));
         locationReporter->SetAttribute("Terminator", PointerValue(e2Terminator));
+        locationReporter->SetAttribute("Trigger", PointerValue(locationTrigger));
 
         // Configure E2 terminator
         e2Terminator->SetAttribute("NearRtRic", PointerValue(nearRtRic1App));
-        e2Terminator->SetAttribute("RegistrationIntervalRv", StringValue("ns3::ConstantRandomVariable[Constant=1000]")); // 设置为1000秒，确保只注册一次
-        e2Terminator->SetAttribute("SendIntervalRv", StringValue("ns3::ConstantRandomVariable[Constant=10]")); // 位置报告间隔改为10秒，减少频率
-        e2Terminator->SetAttribute("TransmissionDelayRv", StringValue("ns3::ConstantRandomVariable[Constant=0.01]")); // 增加传输延迟
+        e2Terminator->SetAttribute("RegistrationIntervalRv", StringValue(dormantIntervalRv));
+        e2Terminator->SetAttribute("SendIntervalRv", StringValue(dormantIntervalRv));
+        e2Terminator->SetAttribute("TransmissionDelayRv", StringValue(e2ReportDelayRv));
 
         // Add location reporter to terminator
         e2Terminator->AddReporter(locationReporter);
@@ -557,16 +1057,18 @@ int main(int argc, char* argv[])
     for (uint32_t i = 0; i < cluster2Nodes.GetN(); ++i)
     {
         Ptr<OranReporterLocation> locationReporter = CreateObject<OranReporterLocation>();
+        Ptr<OranReportTriggerPeriodic> locationTrigger = CreateObject<OranReportTriggerPeriodic>();
         Ptr<OranE2NodeTerminatorWired> e2Terminator = CreateObject<OranE2NodeTerminatorWired>();
 
-        // Configure location reporter（不显式设置Trigger，使用默认的Periodic触发器）
+        locationTrigger->SetAttribute("IntervalRv", StringValue(dormantIntervalRv));
         locationReporter->SetAttribute("Terminator", PointerValue(e2Terminator));
+        locationReporter->SetAttribute("Trigger", PointerValue(locationTrigger));
 
         // Configure E2 terminator
         e2Terminator->SetAttribute("NearRtRic", PointerValue(nearRtRic2App));
-        e2Terminator->SetAttribute("RegistrationIntervalRv", StringValue("ns3::ConstantRandomVariable[Constant=1000]")); // 设置为1000秒，确保只注册一次
-        e2Terminator->SetAttribute("SendIntervalRv", StringValue("ns3::ConstantRandomVariable[Constant=10]")); // 位置报告间隔改为10秒，减少频率
-        e2Terminator->SetAttribute("TransmissionDelayRv", StringValue("ns3::ConstantRandomVariable[Constant=0.01]")); // 增加传输延迟
+        e2Terminator->SetAttribute("RegistrationIntervalRv", StringValue(dormantIntervalRv));
+        e2Terminator->SetAttribute("SendIntervalRv", StringValue(dormantIntervalRv));
+        e2Terminator->SetAttribute("TransmissionDelayRv", StringValue(e2ReportDelayRv));
 
         // Add location reporter to terminator
         e2Terminator->AddReporter(locationReporter);
@@ -616,6 +1118,48 @@ int main(int argc, char* argv[])
     // DU4直连CU2，统计DU4的控制组流量
     appC2[0]->TraceConnectWithoutContext("DataForwarded", MakeCallback(&OnDataForwarded)); // DU4
 
+    nearRtRicE2Terminator1->TraceConnectWithoutContext("ReportReceived",
+                                                       MakeBoundCallback(&OnE2ReportReceived,
+                                                                         std::string("NearRT-RIC-1")));
+    nearRtRicE2Terminator2->TraceConnectWithoutContext("ReportReceived",
+                                                       MakeBoundCallback(&OnE2ReportReceived,
+                                                                         std::string("NearRT-RIC-2")));
+    nearRtRicE2Terminator1->TraceConnectWithoutContext("CommandSent",
+                                                       MakeBoundCallback(&OnE2CommandSent,
+                                                                         std::string("NearRT-RIC-1")));
+    nearRtRicE2Terminator2->TraceConnectWithoutContext("CommandSent",
+                                                       MakeBoundCallback(&OnE2CommandSent,
+                                                                         std::string("NearRT-RIC-2")));
+
+    appC1[0]->TraceConnectWithoutContext("ForwardingTableUpdated",
+                                         MakeBoundCallback(&OnForwardingTableUpdated,
+                                                           std::string("DU1")));
+    appC1[1]->TraceConnectWithoutContext("ForwardingTableUpdated",
+                                         MakeBoundCallback(&OnForwardingTableUpdated,
+                                                           std::string("DU2")));
+    appC1[2]->TraceConnectWithoutContext("ForwardingTableUpdated",
+                                         MakeBoundCallback(&OnForwardingTableUpdated,
+                                                           std::string("DU3")));
+    appC2[0]->TraceConnectWithoutContext("ForwardingTableUpdated",
+                                         MakeBoundCallback(&OnForwardingTableUpdated,
+                                                           std::string("DU4")));
+    appC2[1]->TraceConnectWithoutContext("ForwardingTableUpdated",
+                                         MakeBoundCallback(&OnForwardingTableUpdated,
+                                                           std::string("DU5")));
+    appC2[2]->TraceConnectWithoutContext("ForwardingTableUpdated",
+                                         MakeBoundCallback(&OnForwardingTableUpdated,
+                                                           std::string("DU6")));
+
+    auto requestClusterReports = [&](const std::vector<Ptr<OranE2NodeTerminatorWired>>& terms) {
+        for (const auto& term : terms)
+        {
+            if (term != nullptr)
+            {
+                term->RequestImmediateReports();
+            }
+        }
+    };
+
     // 各DU本地发送到自身8080，进入OranForwardingApp数据面 - 使用OnOff模式
     auto installSelfSender = [&](Ptr<Node> duNode, Ipv4Address selfAddr, std::string rate) {
         OnOffHelper onoff("ns3::UdpSocketFactory", Address(InetSocketAddress(selfAddr, 8080)));
@@ -642,39 +1186,268 @@ int main(int argc, char* argv[])
     installSelfSender(cluster2Nodes.Get(1), du5Addr, "2Mbps"); // DU5（OnOff 2Mbps）
     installSelfSender(cluster2Nodes.Get(2), du6Addr, "2Mbps"); // DU6
 
-    // 初始转发表（移动前 t < 8s）：基于网格拓扑的最短路径
-    Simulator::Schedule(Seconds(3.5), [=]() {
-        // Cluster1 - 使用最近的CU1
-        appC1[0]->UpdateForwardingTable("NEXT", cu1Addr);    // DU1 -> CU1 (直连)
-        appC1[1]->UpdateForwardingTable("NEXT", du3Addr);    // DU2 -> DU3 (中继)
-        appC1[2]->UpdateForwardingTable("NEXT", cu1Addr);    // DU3 -> CU1 (直连)
-        
-        // Cluster2 - 使用最近的CU2  
-        appC2[0]->UpdateForwardingTable("NEXT", cu2Addr);    // DU4 -> CU2 (直连)
-        appC2[1]->UpdateForwardingTable("NEXT", du6Addr);    // DU5 -> DU6 (中继)
-        appC2[2]->UpdateForwardingTable("NEXT", cu2Addr);    // DU6 -> CU2 (直连)
-        
-        NS_LOG_INFO("Initial forwarding rules set: each DU uses nearest CU");
-    });
+    const std::vector<Ptr<OranE2NodeTerminatorWired>> cluster1Terms = {e2TermC1[0],
+                                                                        e2TermC1[1],
+                                                                        e2TermC1[2],
+                                                                        e2TermC1[3]};
+    const std::vector<Ptr<OranE2NodeTerminatorWired>> cluster2Terms = {e2TermC2[0],
+                                                                        e2TermC2[1],
+                                                                        e2TermC2[2],
+                                                                        e2TermC2[3]};
 
-    // 移动后转发表更新（t >= 8s）：每个DU仍使用最近的CU
-    Simulator::Schedule(Seconds(swapTime + 0.2), [=]() {
-        // DU1和DU4没有移动，保持原有路径不变
-        
-        // DU2现在在Cluster2位置，使用最近的CU2
-        appC1[1]->UpdateForwardingTable("NEXT", du3Addr);    // DU2 -> DU3 (中继)
-        // DU3现在在Cluster2位置，到CU2
-        appC1[2]->UpdateForwardingTable("NEXT", cu2Addr);    // DU3 -> CU2 (直连)
-        
-        // DU5现在在Cluster1位置，使用最近的CU1  
-        appC2[1]->UpdateForwardingTable("NEXT", du6Addr);    // DU5 -> DU6 (中继)
-        // DU6现在在Cluster1位置，到CU1
-        appC2[2]->UpdateForwardingTable("NEXT", cu1Addr);    // DU6 -> CU1 (直连)
-        
-        NS_LOG_UNCOND("🔄 FORWARDING_UPDATE: Routing tables updated at t=" << Simulator::Now().GetSeconds() << "s");
-        NS_LOG_UNCOND("🔗 LINK_RESTORE: DU3→CU2, DU6→CU1 links restored");
-        NS_LOG_INFO("Post-mobility forwarding rules updated: each DU uses nearest CU");
-    });
+    auto buildDesiredNextHop = [=]() {
+        std::map<std::string, Ipv4Address> nextHop;
+        bool postSwap = Simulator::Now().GetSeconds() >= swapTime;
+
+        nextHop["DU1"] = cu1Addr;
+        nextHop["DU2"] = du3Addr;
+        nextHop["DU3"] = postSwap ? cu2Addr : cu1Addr;
+        nextHop["DU4"] = cu2Addr;
+        nextHop["DU5"] = du6Addr;
+        nextHop["DU6"] = postSwap ? cu1Addr : cu2Addr;
+
+        return nextHop;
+    };
+
+    auto queueForwardCommand =
+        [&](const std::string& nodeLabel,
+            Ptr<OranE2NodeTerminatorWired> terminator,
+            const Ipv4Address& destination,
+            std::vector<Ptr<OranCommand>>& commandsRic1,
+            std::vector<Ptr<OranCommand>>& commandsRic2,
+            ReconfigurationEvent* event) {
+            Ipv4Address current = Ipv4Address::GetZero();
+            auto it = g_lastAppliedNextHop.find(nodeLabel);
+            if (it != g_lastAppliedNextHop.end())
+            {
+                current = it->second;
+            }
+
+            if (current == destination)
+            {
+                return;
+            }
+
+            Ptr<OranCommandForward> command =
+                OranCommandForward::CreateForwardCommand("NEXT", destination, 0, nodeLabel);
+            command->SetTargetE2NodeId(terminator->GetE2NodeId());
+
+            if (terminator->GetNearRtRic() == nearRtRic1App)
+            {
+                commandsRic1.push_back(command);
+            }
+            else
+            {
+                commandsRic2.push_back(command);
+            }
+
+            if (event != nullptr)
+            {
+                event->pendingNodes.insert(nodeLabel);
+                event->expectedForwardingUpdates++;
+            }
+        };
+
+    auto scheduleControlSlot = [=, &requestClusterReports](uint32_t slotIndex, bool topologyChanged) {
+        double slotStart = Simulator::Now().GetSeconds();
+        SlotMetrics& slot = GetOrCreateSlotMetrics(slotIndex);
+        slot.topologyChanged = topologyChanged;
+        slot.controlRounds++;
+        RecordControllerStage(slotIndex,
+                              "non-rt-ric",
+                              "non_rt_orchestration",
+                              slotStart,
+                              g_nonRtProcessingDelay);
+
+        Simulator::Schedule(Seconds(g_nonRtProcessingDelay), [=, &requestClusterReports]() {
+            double controlDispatchTime = Simulator::Now().GetSeconds();
+            RecordControlMessage(slotIndex,
+                                 controlDispatchTime,
+                                 "A1",
+                                 "downlink",
+                                 "NonRT-RIC",
+                                 "NearRT-RIC-1",
+                                 "slot_policy_update",
+                                 static_cast<uint32_t>(
+                                     BuildA1PolicyPayload(slotIndex, "NearRT-RIC-1", topologyChanged)
+                                         .size()));
+            RecordControlMessage(slotIndex,
+                                 controlDispatchTime,
+                                 "A1",
+                                 "downlink",
+                                 "NonRT-RIC",
+                                 "NearRT-RIC-2",
+                                 "slot_policy_update",
+                                 static_cast<uint32_t>(
+                                     BuildA1PolicyPayload(slotIndex, "NearRT-RIC-2", topologyChanged)
+                                         .size()));
+
+            if (topologyChanged)
+            {
+                RecordControlMessage(
+                    slotIndex,
+                    controlDispatchTime,
+                    "O1",
+                    "downlink",
+                    "NonRT-RIC",
+                    "DU2",
+                    "cz_reassignment",
+                    static_cast<uint32_t>(BuildO1ReassignmentPayload(slotIndex, "DU2", "NearRT-RIC-2")
+                                              .size()));
+                RecordControlMessage(
+                    slotIndex,
+                    controlDispatchTime,
+                    "O1",
+                    "downlink",
+                    "NonRT-RIC",
+                    "DU3",
+                    "cz_reassignment",
+                    static_cast<uint32_t>(BuildO1ReassignmentPayload(slotIndex, "DU3", "NearRT-RIC-2")
+                                              .size()));
+                RecordControlMessage(
+                    slotIndex,
+                    controlDispatchTime,
+                    "O1",
+                    "downlink",
+                    "NonRT-RIC",
+                    "DU5",
+                    "cz_reassignment",
+                    static_cast<uint32_t>(BuildO1ReassignmentPayload(slotIndex, "DU5", "NearRT-RIC-1")
+                                              .size()));
+                RecordControlMessage(
+                    slotIndex,
+                    controlDispatchTime,
+                    "O1",
+                    "downlink",
+                    "NonRT-RIC",
+                    "DU6",
+                    "cz_reassignment",
+                    static_cast<uint32_t>(BuildO1ReassignmentPayload(slotIndex, "DU6", "NearRT-RIC-1")
+                                              .size()));
+
+                Simulator::Schedule(Seconds(g_o1TransmissionDelay), [=]() {
+                    auto reattachTerminator = [](Ptr<OranE2NodeTerminatorWired> term,
+                                                 Ptr<OranNearRtRic> newRic) {
+                        term->SetAttribute("NearRtRic", PointerValue(newRic));
+                        term->RefreshRegistration();
+                    };
+
+                    reattachTerminator(e2TermC1[1], nearRtRic2App);
+                    reattachTerminator(e2TermC1[2], nearRtRic2App);
+                    reattachTerminator(e2TermC2[1], nearRtRic1App);
+                    reattachTerminator(e2TermC2[2], nearRtRic1App);
+
+                    if (g_activeReconfigurationEvent >= 0)
+                    {
+                        ReconfigurationEvent& event =
+                            g_reconfigurationEvents[g_activeReconfigurationEvent];
+                        if (event.slotIndex == slotIndex)
+                        {
+                            event.o1CompletionTime = Simulator::Now().GetSeconds();
+                        }
+                    }
+                });
+            }
+
+            g_slotRuntime[slotIndex] = SlotRuntimeState{8, 0};
+            g_slotReadyCallbacks[slotIndex] = [=]() {
+                double reportsReadyTime = Simulator::Now().GetSeconds();
+
+                RecordControllerStage(slotIndex,
+                                      "near-rt-ric-1",
+                                      "near_rt_orchestration",
+                                      reportsReadyTime,
+                                      g_nearRtProcessingDelay);
+                RecordControllerStage(slotIndex,
+                                      "near-rt-ric-1",
+                                      "routing_xapp",
+                                      reportsReadyTime + g_nearRtProcessingDelay,
+                                      g_routingProcessingDelay);
+                RecordControllerStage(slotIndex,
+                                      "near-rt-ric-2",
+                                      "near_rt_orchestration",
+                                      reportsReadyTime,
+                                      g_nearRtProcessingDelay);
+                RecordControllerStage(slotIndex,
+                                      "near-rt-ric-2",
+                                      "routing_xapp",
+                                      reportsReadyTime + g_nearRtProcessingDelay,
+                                      g_routingProcessingDelay);
+
+                Simulator::Schedule(
+                    Seconds(g_nearRtProcessingDelay + g_routingProcessingDelay),
+                    [=]() {
+                        ReconfigurationEvent* activeEvent = nullptr;
+                        if (g_activeReconfigurationEvent >= 0)
+                        {
+                            ReconfigurationEvent& event =
+                                g_reconfigurationEvents[g_activeReconfigurationEvent];
+                            if (event.slotIndex == slotIndex)
+                            {
+                                event.nearRtProcessingCompletionTime =
+                                    Simulator::Now().GetSeconds();
+                                activeEvent = &event;
+                            }
+                        }
+
+                        std::vector<Ptr<OranCommand>> commandsRic1;
+                        std::vector<Ptr<OranCommand>> commandsRic2;
+                        std::map<std::string, Ipv4Address> desiredNextHop = buildDesiredNextHop();
+
+                        queueForwardCommand("DU1",
+                                            e2TermC1[0],
+                                            desiredNextHop["DU1"],
+                                            commandsRic1,
+                                            commandsRic2,
+                                            nullptr);
+                        queueForwardCommand("DU2",
+                                            e2TermC1[1],
+                                            desiredNextHop["DU2"],
+                                            commandsRic1,
+                                            commandsRic2,
+                                            nullptr);
+                        queueForwardCommand("DU3",
+                                            e2TermC1[2],
+                                            desiredNextHop["DU3"],
+                                            commandsRic1,
+                                            commandsRic2,
+                                            topologyChanged ? activeEvent : nullptr);
+                        queueForwardCommand("DU4",
+                                            e2TermC2[0],
+                                            desiredNextHop["DU4"],
+                                            commandsRic1,
+                                            commandsRic2,
+                                            nullptr);
+                        queueForwardCommand("DU5",
+                                            e2TermC2[1],
+                                            desiredNextHop["DU5"],
+                                            commandsRic1,
+                                            commandsRic2,
+                                            nullptr);
+                        queueForwardCommand("DU6",
+                                            e2TermC2[2],
+                                            desiredNextHop["DU6"],
+                                            commandsRic1,
+                                            commandsRic2,
+                                            topologyChanged ? activeEvent : nullptr);
+
+                        nearRtRic1App->GetE2Terminator()->ProcessCommands(commandsRic1);
+                        nearRtRic2App->GetE2Terminator()->ProcessCommands(commandsRic2);
+
+                        if (activeEvent != nullptr)
+                        {
+                            activeEvent->e2CommandDispatchTime = Simulator::Now().GetSeconds();
+                        }
+                    });
+            };
+
+            Simulator::Schedule(Seconds(std::max(g_a1TransmissionDelay, topologyChanged ? g_o1TransmissionDelay : 0.0)),
+                                [=, &requestClusterReports]() {
+                                    requestClusterReports(cluster1Terms);
+                                    requestClusterReports(cluster2Terms);
+                                });
+        });
+    };
 
     // 创建7个CSV文件用于不同的吞吐量统计
     std::shared_ptr<std::ofstream> csvDu2Flow = std::make_shared<std::ofstream>("du2_flow_throughput.csv");
@@ -705,7 +1478,16 @@ int main(int argc, char* argv[])
     std::function<void(void)> sampleCsv;
     static double lastSampleTime = 0.0;  // 使用静态变量保存上次采样时间
     
-    sampleCsv = [csvDu2Flow, csvDu5Flow, csvCluster1, csvCluster2, csvDu1Control, csvDu4Control, csvDu3Aggregate, &sampleCsv, simulationTime]() {
+    sampleCsv = [csvDu2Flow,
+                 csvDu5Flow,
+                 csvCluster1,
+                 csvCluster2,
+                 csvDu1Control,
+                 csvDu4Control,
+                 csvDu3Aggregate,
+                 &sampleCsv,
+                 simulationTime,
+                 swapTime]() {
         double now = Simulator::Now().GetSeconds();
         double delta = now - lastSampleTime;
         if (delta <= 0.001) { 
@@ -738,6 +1520,15 @@ int main(int argc, char* argv[])
         *csvDu1Control << now << "," << mbpsDu1Control << "," << du1Path << "\n";
         *csvDu4Control << now << "," << mbpsDu4Control << "," << du4Path << "\n";
         *csvDu3Aggregate << now << "," << mbpsDu3Aggregate << "," << du3Path << "\n";
+
+        ThroughputSample sample;
+        sample.time = now;
+        sample.du2FlowMbps = mbpsDu2Flow;
+        sample.du5FlowMbps = mbpsDu5Flow;
+        sample.cluster1Mbps = mbpsCluster1;
+        sample.cluster2Mbps = mbpsCluster2;
+        sample.totalMbps = mbpsCluster1 + mbpsCluster2;
+        g_throughputSamples.push_back(sample);
         
         csvDu2Flow->flush();
         csvDu5Flow->flush();
@@ -768,7 +1559,7 @@ int main(int argc, char* argv[])
         lastSampleTime = now;
         
         // 细粒度采样：只在关键时间窗口内以0.05s间隔采样
-        if (now < 9.5) {
+        if (now < std::min(simulationTime - 1.0, swapTime + 3.0)) {
             Simulator::Schedule(Seconds(0.05), sampleCsv);
         }
     };
@@ -780,9 +1571,9 @@ int main(int argc, char* argv[])
     //
     if (enableTracing)
     {
-        NS_LOG_INFO("Enabling packet capture...");
-        
-        // Enable pcap tracing on key links
+        NS_LOG_INFO("Enabling transport packet capture...");
+
+        // Enable pcap tracing on key abstract transport segments
         p2p.EnablePcap("oran-forwarding-backbone", nonRtToNear1Devices);
         csma1.EnablePcap("oran-forwarding-cluster1", cluster1Devices);
         csma2.EnablePcap("oran-forwarding-cluster2", cluster2Devices);
@@ -820,7 +1611,22 @@ int main(int argc, char* argv[])
     NS_LOG_INFO("=== Starting Simulation ===");
     NS_LOG_INFO("Simulation will run for " << simulationTime << " seconds");
 
-    // 在 swapTime 时刻执行：DU2/DU3 与 DU5/DU6 的位置互换 + RIC切换 + 临时加快上报
+    if (std::fabs(std::remainder(swapTime - controlStartTime, slotDuration)) > 1e-6)
+    {
+        NS_LOG_WARN("swapTime is not aligned with the configured control slot boundary");
+    }
+
+    for (double slotStart = controlStartTime; slotStart < simulationTime; slotStart += slotDuration)
+    {
+        uint32_t slotIndex = static_cast<uint32_t>(GetControlSlotIndex(slotStart));
+        bool topologyChanged = std::fabs(slotStart - swapTime) < 1e-6;
+
+        Simulator::Schedule(Seconds(slotStart), [=, &scheduleControlSlot]() {
+            scheduleControlSlot(slotIndex, topologyChanged);
+        });
+    }
+
+    // 在 swapTime 时刻执行：DU2/DU3 与 DU5/DU6 的位置互换，并进入 slot 对齐的控制重配置
     // 选择的索引：cluster1Nodes[1]=DU2, [2]=DU3, cluster2Nodes[1]=DU5, [2]=DU6
     Simulator::Schedule(Seconds(swapTime), [=]() {
         NS_LOG_UNCOND("🚀 MOBILITY_EVENT: Position swap started at t=" << Simulator::Now().GetSeconds() << "s");
@@ -842,43 +1648,31 @@ int main(int argc, char* argv[])
         du5Mob->SetPosition(p2);
         du6Mob->SetPosition(p3);
         
-        // 1.5) 临时清空转发表，模拟链路中断 💥
-        NS_LOG_UNCOND("💥 LINK_BREAK: Temporarily clearing forwarding tables to simulate link disruption");
-        // 清空DU3和DU6的转发表，模拟它们无法到达原来的CU
+        // 1.5) 临时清空转发表，模拟控制重配置期间的瞬时业务扰动 💥
+        NS_LOG_UNCOND("💥 RECONFIG_GAP: Temporarily clearing forwarding tables to model transient service disruption");
+        // 清空 DU3 和 DU6 的关键 next hop，直到 slot 内控制流程完成重新下发
         appC1[2]->UpdateForwardingTable("NEXT", Ipv4Address("0.0.0.0")); // DU3断开到CU1
         appC2[2]->UpdateForwardingTable("NEXT", Ipv4Address("0.0.0.0")); // DU6断开到CU2
 
-        // 2) RIC切换与临时加快上报（SendIntervalRv 降至0.5s，加快RIC感知，5s后恢复）
-        // 注意：避免 Deactivate/Activate 以免触发 Reporter Trigger 设置错误
-        auto reattach = [](Ptr<OranE2NodeTerminatorWired> term, Ptr<OranNearRtRic> newRic) {
-            term->SetAttribute("NearRtRic", PointerValue(newRic));
-            term->SetAttribute("SendIntervalRv", StringValue("ns3::ConstantRandomVariable[Constant=0.5]"));
-        };
+        ReconfigurationEvent event;
+        event.eventId = static_cast<uint32_t>(g_reconfigurationEvents.size());
+        event.slotIndex = static_cast<uint32_t>(GetControlSlotIndex(Simulator::Now().GetSeconds()));
+        event.triggerTime = Simulator::Now().GetSeconds();
+        g_reconfigurationEvents.push_back(event);
+        g_activeReconfigurationEvent = static_cast<int32_t>(g_reconfigurationEvents.size() - 1);
 
-        // C1: DU2/DU3 → RIC2
-        reattach(e2TermC1[1], nearRtRic2App);
-        reattach(e2TermC1[2], nearRtRic2App);
-        // C2: DU5/DU6 → RIC1
-        reattach(e2TermC2[1], nearRtRic1App);
-        reattach(e2TermC2[2], nearRtRic1App);
-
-        NS_LOG_INFO("[Swap] Completed at t=" << Simulator::Now().GetSeconds());
-    });
-
-    // 在 swapTime+5 恢复上报间隔到原值（10s）
-    Simulator::Schedule(Seconds(swapTime + 5.0), [=]() {
-        auto restore = [](Ptr<OranE2NodeTerminatorWired> term) {
-            term->SetAttribute("SendIntervalRv", StringValue("ns3::ConstantRandomVariable[Constant=10]"));
-        };
-        restore(e2TermC1[1]);
-        restore(e2TermC1[2]);
-        restore(e2TermC2[1]);
-        restore(e2TermC2[2]);
-        NS_LOG_INFO("[Swap] Restored send interval at t=" << Simulator::Now().GetSeconds());
+        NS_LOG_INFO("[Swap] Mobility update completed; control-plane reconfiguration follows the "
+                    << "slot-level A1/O1/E2 pipeline");
     });
 
     Simulator::Stop(Seconds(simulationTime));
     Simulator::Run();
+
+    WriteControlOverheadCsv("control_signaling_per_slot.csv");
+    WriteControlMessageCsv("control_message_volume.csv");
+    WriteControllerProcessingCsv("controller_processing_time.csv");
+    WriteReconfigurationLatencyCsv("reconfiguration_latency.csv");
+    WriteTransientThroughputImpactCsv("transient_throughput_impact.csv");
 
     NS_LOG_INFO("=== Simulation Complete ===");
     NS_LOG_INFO("Check the following files for results:");
@@ -891,11 +1685,17 @@ int main(int argc, char* argv[])
     NS_LOG_INFO("Control group CSV files (unaffected by mobility):");
     NS_LOG_INFO("- du1_control_throughput.csv (DU1->CU1, control group)");
     NS_LOG_INFO("- du4_control_throughput.csv (DU4->CU2, control group)");
+    NS_LOG_INFO("Control overhead CSV files:");
+    NS_LOG_INFO("- control_signaling_per_slot.csv (A1/O1/E2 events and control updates per slot)");
+    NS_LOG_INFO("- control_message_volume.csv (per-message serialized control-plane volume)");
+    NS_LOG_INFO("- controller_processing_time.csv (non-RT/near-RT/routing processing stages)");
+    NS_LOG_INFO("- reconfiguration_latency.csv (trigger-to-forwarding-update latency)");
+    NS_LOG_INFO("- transient_throughput_impact.csv (temporary throughput degradation summary)");
     if (enableTracing) {
-        NS_LOG_INFO("Network traces:");
-        NS_LOG_INFO("- oran-forwarding-backbone-*.pcap (backbone links)");
-        NS_LOG_INFO("- oran-forwarding-cluster1-*.pcap (cluster 1 internal)");
-        NS_LOG_INFO("- oran-forwarding-cluster2-*.pcap (cluster 2 internal)");
+        NS_LOG_INFO("Transport trace files:");
+        NS_LOG_INFO("- oran-forwarding-backbone-*.pcap (abstract inter-RIC transport)");
+        NS_LOG_INFO("- oran-forwarding-cluster1-*.pcap (abstract cluster-1 transport)");
+        NS_LOG_INFO("- oran-forwarding-cluster2-*.pcap (abstract cluster-2 transport)");
         NS_LOG_INFO("- oran-forwarding.tr (ASCII trace)");
     }
 

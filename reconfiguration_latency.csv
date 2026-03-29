@@ -1,0 +1,2 @@
+event_id,slot_index,trigger_time_s,o1_completion_time_s,e2_report_completion_time_s,near_rt_processing_completion_time_s,e2_command_dispatch_time_s,forwarding_update_completion_time_s,reconfiguration_latency_ms,expected_forwarding_updates,completed_forwarding_updates
+0,1,8,8.024,8.034,8.059,8.059,8.062,62,2,2

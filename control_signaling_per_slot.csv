@@ -1,0 +1,4 @@
+slot_index,slot_start_s,topology_changed,control_rounds,a1_messages,o1_messages,e2_reports,e2_commands,a1_serialized_bytes,o1_serialized_bytes,e2_report_serialized_bytes,e2_command_serialized_bytes,total_control_serialized_bytes,forwarding_updates,non_rt_processing_ms,near_rt_processing_ms,routing_processing_ms,controller_critical_path_ms
+0,4,0,1,2,0,8,6,180,0,528,198,906,6,20,30,20,45
+1,8,1,1,2,4,8,2,180,360,528,66,1134,2,20,30,20,45
+2,12,0,1,2,0,8,0,180,0,536,0,716,0,20,30,20,45
