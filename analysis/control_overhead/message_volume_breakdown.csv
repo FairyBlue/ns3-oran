@@ -1,0 +1,5 @@
+Interface,Direction,Message type,Count,Total bytes,Avg bytes,Min bytes,Max bytes
+A1,downlink,slot_policy_update,6,540,90.0,90,90
+E2,downlink,FORWARD,8,264,33.0,33,33
+E2,uplink,ns3::OranReportLocation,24,1592,66.333,65,68
+O1,downlink,cz_reassignment,4,360,90.0,90,90

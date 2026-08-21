@@ -76,8 +76,11 @@ static uint64_t g_cluster2TotalBytesSinceLast = 0;
 static uint64_t g_du1ControlFlowBytesSinceLast = 0;
 // 6. DU4对照组流量（DU4→CU2，不受移动影响）
 static uint64_t g_du4ControlFlowBytesSinceLast = 0;
-// 7. DU3聚合流量（DU3→CU，包含DU2+DU3的聚合突发效应）
-static uint64_t g_du3AggregateFlowBytesSinceLast = 0;
+// 7. DU3本地源流量（不包含经DU3中继的DU2流量）
+static uint64_t g_du3OriginatedFlowBytesSinceLast = 0;
+// CU forwarding application实际接收的字节，用于交叉验证转发侧统计。
+static uint64_t g_cu1ReceivedBytesSinceLast = 0;
+static uint64_t g_cu2ReceivedBytesSinceLast = 0;
 
 struct SlotMetrics
 {
@@ -624,14 +627,28 @@ static void OnDataForwarded(uint32_t size, Ipv4Address src, Ipv4Address dst)
         g_du4ControlFlowBytesSinceLast += size;
     }
     
-    // 6. DU3聚合流量统计（DU3→CU，包含DU2+DU3的聚合突发效应）
+    // 6. 仅统计DU3本地产生并发往CU的流量。
     if ((src == g_du3Addr && dst == g_cu1Addr) || (src == g_du3Addr && dst == g_cu2Addr))
     {
-        g_du3AggregateFlowBytesSinceLast += size;
+        g_du3OriginatedFlowBytesSinceLast += size;
     }
     
     // 调试输出
     NS_LOG_DEBUG("DataForwarded: " << size << " bytes from " << src << " to " << dst);
+}
+
+static void OnCuDataReceived(uint32_t cuIndex, uint32_t size, Ipv4Address source)
+{
+    if (cuIndex == 1)
+    {
+        g_cu1ReceivedBytesSinceLast += size;
+    }
+    else if (cuIndex == 2)
+    {
+        g_cu2ReceivedBytesSinceLast += size;
+    }
+
+    NS_LOG_DEBUG("CU" << cuIndex << " received " << size << " bytes from " << source);
 }
 
 /**
@@ -1108,15 +1125,21 @@ int main(int argc, char* argv[])
     g_du5Addr = du5Addr;
     g_du6Addr = du6Addr;
 
-    // 连接 DataForwarded Trace（只在关键转发节点统计，避免重复计数）
-    // DU3是Cluster1的聚合转发点，统计所有经过DU3的流量
+    // 连接 DataForwarded Trace（只在最后一跳关键节点统计，避免重复计数）。
+    // DU3同时承载DU2中继流量和DU3本地源流量，回调通过源地址区分二者。
     appC1[2]->TraceConnectWithoutContext("DataForwarded", MakeCallback(&OnDataForwarded)); // DU3
-    // DU6是Cluster2的聚合转发点，统计所有经过DU6的流量
+    // DU6同时承载DU5中继流量和DU6本地源流量。
     appC2[2]->TraceConnectWithoutContext("DataForwarded", MakeCallback(&OnDataForwarded)); // DU6
     // DU1直连CU1，统计DU1的控制组流量
     appC1[0]->TraceConnectWithoutContext("DataForwarded", MakeCallback(&OnDataForwarded)); // DU1
     // DU4直连CU2，统计DU4的控制组流量
     appC2[0]->TraceConnectWithoutContext("DataForwarded", MakeCallback(&OnDataForwarded)); // DU4
+
+    // 在CU forwarding application的接收点独立计数，用于验证最后一跳转发统计。
+    appC1[3]->TraceConnectWithoutContext("DataReceived",
+                                         MakeBoundCallback(&OnCuDataReceived, 1));
+    appC2[3]->TraceConnectWithoutContext("DataReceived",
+                                         MakeBoundCallback(&OnCuDataReceived, 2));
 
     nearRtRicE2Terminator1->TraceConnectWithoutContext("ReportReceived",
                                                        MakeBoundCallback(&OnE2ReportReceived,
@@ -1449,14 +1472,21 @@ int main(int argc, char* argv[])
         });
     };
 
-    // 创建7个CSV文件用于不同的吞吐量统计
+    // 创建转发侧、接收侧及交叉验证CSV。
     std::shared_ptr<std::ofstream> csvDu2Flow = std::make_shared<std::ofstream>("du2_flow_throughput.csv");
     std::shared_ptr<std::ofstream> csvDu5Flow = std::make_shared<std::ofstream>("du5_flow_throughput.csv");
     std::shared_ptr<std::ofstream> csvCluster1 = std::make_shared<std::ofstream>("cluster1_total_throughput.csv");
     std::shared_ptr<std::ofstream> csvCluster2 = std::make_shared<std::ofstream>("cluster2_total_throughput.csv");
     std::shared_ptr<std::ofstream> csvDu1Control = std::make_shared<std::ofstream>("du1_control_throughput.csv");
     std::shared_ptr<std::ofstream> csvDu4Control = std::make_shared<std::ofstream>("du4_control_throughput.csv");
-    std::shared_ptr<std::ofstream> csvDu3Aggregate = std::make_shared<std::ofstream>("du3_aggregate_throughput.csv");
+    std::shared_ptr<std::ofstream> csvDu3Originated =
+        std::make_shared<std::ofstream>("du3_originated_flow_throughput.csv");
+    std::shared_ptr<std::ofstream> csvCu1Received =
+        std::make_shared<std::ofstream>("cu1_received_throughput.csv");
+    std::shared_ptr<std::ofstream> csvCu2Received =
+        std::make_shared<std::ofstream>("cu2_received_throughput.csv");
+    std::shared_ptr<std::ofstream> csvCuValidation =
+        std::make_shared<std::ofstream>("cu_receive_validation.csv");
     
     // 写入CSV文件头
     *csvDu2Flow << "time,throughput_mbps,path\n";
@@ -1465,7 +1495,13 @@ int main(int argc, char* argv[])
     *csvCluster2 << "time,throughput_mbps\n";
     *csvDu1Control << "time,throughput_mbps,path\n";
     *csvDu4Control << "time,throughput_mbps,path\n";
-    *csvDu3Aggregate << "time,throughput_mbps,path\n";
+    *csvDu3Originated << "time,throughput_mbps,path\n";
+    *csvCu1Received << "time,throughput_mbps,path\n";
+    *csvCu2Received << "time,throughput_mbps,path\n";
+    *csvCuValidation
+        << "time,cluster1_forwarded_mbps,cu1_received_mbps,cluster1_gap_mbps,"
+           "cluster2_forwarded_mbps,cu2_received_mbps,cluster2_gap_mbps,"
+           "total_forwarded_mbps,total_received_mbps,total_gap_mbps\n";
     
     csvDu2Flow->flush();
     csvDu5Flow->flush();
@@ -1473,6 +1509,10 @@ int main(int argc, char* argv[])
     csvCluster2->flush();
     csvDu1Control->flush();
     csvDu4Control->flush();
+    csvDu3Originated->flush();
+    csvCu1Received->flush();
+    csvCu2Received->flush();
+    csvCuValidation->flush();
 
     // 创建数据采样函数
     std::function<void(void)> sampleCsv;
@@ -1484,7 +1524,10 @@ int main(int argc, char* argv[])
                  csvCluster2,
                  csvDu1Control,
                  csvDu4Control,
-                 csvDu3Aggregate,
+                 csvDu3Originated,
+                 csvCu1Received,
+                 csvCu2Received,
+                 csvCuValidation,
                  &sampleCsv,
                  simulationTime,
                  swapTime]() {
@@ -1496,21 +1539,24 @@ int main(int argc, char* argv[])
             return; 
         }
         
-        // 计算7种不同的吞吐量
+        // 使用同一采样区间计算转发侧和CU接收侧吞吐量。
         double mbpsDu2Flow = (g_du2FlowBytesSinceLast * 8.0) / (delta * 1e6);
         double mbpsDu5Flow = (g_du5FlowBytesSinceLast * 8.0) / (delta * 1e6);
         double mbpsCluster1 = (g_cluster1TotalBytesSinceLast * 8.0) / (delta * 1e6);
         double mbpsCluster2 = (g_cluster2TotalBytesSinceLast * 8.0) / (delta * 1e6);
         double mbpsDu1Control = (g_du1ControlFlowBytesSinceLast * 8.0) / (delta * 1e6);
         double mbpsDu4Control = (g_du4ControlFlowBytesSinceLast * 8.0) / (delta * 1e6);
-        double mbpsDu3Aggregate = (g_du3AggregateFlowBytesSinceLast * 8.0) / (delta * 1e6);
+        double mbpsDu3Originated =
+            (g_du3OriginatedFlowBytesSinceLast * 8.0) / (delta * 1e6);
+        double mbpsCu1Received = (g_cu1ReceivedBytesSinceLast * 8.0) / (delta * 1e6);
+        double mbpsCu2Received = (g_cu2ReceivedBytesSinceLast * 8.0) / (delta * 1e6);
         
         // 确定当前路径描述
         std::string du2Path = (now < g_swapTime) ? "DU2->DU3->CU1" : "DU2->DU3->CU2";
         std::string du5Path = (now < g_swapTime) ? "DU5->DU6->CU2" : "DU5->DU6->CU1";
         std::string du1Path = "DU1->CU1";  // 对照组，路径不变
         std::string du4Path = "DU4->CU2";  // 对照组，路径不变
-        std::string du3Path = (now < g_swapTime) ? "DU3->CU1" : "DU3->CU2";  // DU3聚合流量路径
+        std::string du3Path = (now < g_swapTime) ? "DU3->CU1" : "DU3->CU2";
         
         // 写入CSV文件
         *csvDu2Flow << now << "," << mbpsDu2Flow << "," << du2Path << "\n";
@@ -1519,7 +1565,18 @@ int main(int argc, char* argv[])
         *csvCluster2 << now << "," << mbpsCluster2 << "\n";
         *csvDu1Control << now << "," << mbpsDu1Control << "," << du1Path << "\n";
         *csvDu4Control << now << "," << mbpsDu4Control << "," << du4Path << "\n";
-        *csvDu3Aggregate << now << "," << mbpsDu3Aggregate << "," << du3Path << "\n";
+        *csvDu3Originated << now << "," << mbpsDu3Originated << "," << du3Path << "\n";
+        *csvCu1Received << now << "," << mbpsCu1Received << ",received@CU1\n";
+        *csvCu2Received << now << "," << mbpsCu2Received << ",received@CU2\n";
+
+        double cluster1Gap = mbpsCluster1 - mbpsCu1Received;
+        double cluster2Gap = mbpsCluster2 - mbpsCu2Received;
+        double totalForwarded = mbpsCluster1 + mbpsCluster2;
+        double totalReceived = mbpsCu1Received + mbpsCu2Received;
+        *csvCuValidation << now << "," << mbpsCluster1 << "," << mbpsCu1Received << ","
+                         << cluster1Gap << "," << mbpsCluster2 << "," << mbpsCu2Received << ","
+                         << cluster2Gap << "," << totalForwarded << "," << totalReceived << ","
+                         << (totalForwarded - totalReceived) << "\n";
 
         ThroughputSample sample;
         sample.time = now;
@@ -1536,7 +1593,10 @@ int main(int argc, char* argv[])
         csvCluster2->flush();
         csvDu1Control->flush();
         csvDu4Control->flush();
-        csvDu3Aggregate->flush();
+        csvDu3Originated->flush();
+        csvCu1Received->flush();
+        csvCu2Received->flush();
+        csvCuValidation->flush();
         
         NS_LOG_INFO("Throughput sample t=" << now << "s: DU2=" << mbpsDu2Flow 
                    << " Mbps (" << du2Path << "), DU5=" << mbpsDu5Flow 
@@ -1551,7 +1611,9 @@ int main(int argc, char* argv[])
         g_cluster2TotalBytesSinceLast = 0;
         g_du1ControlFlowBytesSinceLast = 0;
         g_du4ControlFlowBytesSinceLast = 0;
-        g_du3AggregateFlowBytesSinceLast = 0;
+        g_du3OriginatedFlowBytesSinceLast = 0;
+        g_cu1ReceivedBytesSinceLast = 0;
+        g_cu2ReceivedBytesSinceLast = 0;
         
         // 🧹 清理去重缓存，防止内存泄漏
         g_processedPackets.clear();
@@ -1685,6 +1747,11 @@ int main(int argc, char* argv[])
     NS_LOG_INFO("Control group CSV files (unaffected by mobility):");
     NS_LOG_INFO("- du1_control_throughput.csv (DU1->CU1, control group)");
     NS_LOG_INFO("- du4_control_throughput.csv (DU4->CU2, control group)");
+    NS_LOG_INFO("- du3_originated_flow_throughput.csv (DU3-originated flow only)");
+    NS_LOG_INFO("Receive-side validation CSV files:");
+    NS_LOG_INFO("- cu1_received_throughput.csv (traffic received by the CU1 forwarding app)");
+    NS_LOG_INFO("- cu2_received_throughput.csv (traffic received by the CU2 forwarding app)");
+    NS_LOG_INFO("- cu_receive_validation.csv (forwarded-vs-received cross-check)");
     NS_LOG_INFO("Control overhead CSV files:");
     NS_LOG_INFO("- control_signaling_per_slot.csv (A1/O1/E2 events and control updates per slot)");
     NS_LOG_INFO("- control_message_volume.csv (per-message serialized control-plane volume)");

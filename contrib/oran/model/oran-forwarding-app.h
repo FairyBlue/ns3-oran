@@ -177,6 +177,7 @@ class OranForwardingApp : public Application
 
     // Traced callbacks
     TracedCallback<std::string> m_forwardingCommand;       //!< Trace for forwarding commands
+    TracedCallback<uint32_t, Ipv4Address> m_dataReceived;  //!< Trace for data received by this app
     TracedCallback<uint32_t, Ipv4Address, Ipv4Address> m_dataForwarded; //!< Trace for forwarded data
     TracedCallback<std::string, Ipv4Address> m_forwardingTableUpdated;  //!< Trace for applied forwarding entries
 

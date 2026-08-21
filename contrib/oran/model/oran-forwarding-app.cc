@@ -94,6 +94,10 @@ OranForwardingApp::GetTypeId()
                                             "Data was forwarded to another node",
                                             MakeTraceSourceAccessor(&OranForwardingApp::m_dataForwarded),
                                             "ns3::TracedValueCallback::Uint32Ipv4Ipv4")
+                            .AddTraceSource("DataReceived",
+                                            "Data was received by this node's forwarding app",
+                                            MakeTraceSourceAccessor(&OranForwardingApp::m_dataReceived),
+                                            "ns3::TracedCallback::Uint32Ipv4")
                             .AddTraceSource(
                                 "ForwardingTableUpdated",
                                 "A forwarding-table entry was applied",
@@ -278,6 +282,7 @@ OranForwardingApp::HandleDataReceive(Ptr<Socket> socket)
             
             // Get source address for packet-in
             InetSocketAddress fromAddr = InetSocketAddress::ConvertFrom(from);
+            m_dataReceived(packet->GetSize(), fromAddr.GetIpv4());
             
             // For simplicity, forward to first entry in forwarding table
             // In a real implementation, this would have more sophisticated logic

@@ -1,0 +1,26 @@
+Auto-generated control-overhead summary
+=====================================
+
+Reconfiguration occurs in slot 1 at t=8.0 s.
+
+Suggested paper-ready statements:
+
+1. During the reconfiguration slot, the prototype executes 16 control signaling events, including
+   2 A1 updates, 4 O1 updates,
+   8 E2 reports, and 2 E2 commands.
+
+2. The reconfiguration slot carries 1134 bytes of serialized control payload and
+   results in 2 forwarding-table updates.
+
+3. The end-to-end reconfiguration latency is 62.0 ms, while the
+   controller critical path is 45.0 ms.
+
+4. Aggregate throughput drops from 13.0007 Mbps to
+   3.93216 Mbps during reconfiguration, corresponding to a
+   69.75% temporary degradation, and recovers within
+   150 ms.
+
+5. Average serialized payload sizes are approximately 90.0 bytes for A1 policy updates,
+   90.0 bytes for O1 reassignment updates,
+   66.3 bytes for E2 reports, and
+   33.0 bytes for E2 commands.

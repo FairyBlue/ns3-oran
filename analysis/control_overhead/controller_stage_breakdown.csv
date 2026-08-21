@@ -1,0 +1,4 @@
+Slot,Non-RT total (ms),Near-RT total (ms),Routing total (ms),Critical path (ms)
+0,20,30,20,45
+1,20,30,20,45
+2,20,30,20,45

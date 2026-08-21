@@ -115,11 +115,14 @@ After a run, the example generates throughput, control-overhead, and trace outpu
 
 - `du2_flow_throughput.csv`: DU2 path throughput (`DU2->DU3->CU1/CU2`)
 - `du5_flow_throughput.csv`: DU5 path throughput (`DU5->DU6->CU2/CU1`)
-- `du3_aggregate_throughput.csv`: relay-path aggregate throughput on DU3
+- `du3_originated_flow_throughput.csv`: DU3-originated flow throughput (`DU3->CU1/CU2`)
 - `du1_control_throughput.csv`: stationary control flow in cluster 1
 - `du4_control_throughput.csv`: stationary control flow in cluster 2
 - `cluster1_total_throughput.csv`: total throughput to `CU1`
 - `cluster2_total_throughput.csv`: total throughput to `CU2`
+- `cu1_received_throughput.csv`: receive-side throughput observed at `CU1`
+- `cu2_received_throughput.csv`: receive-side throughput observed at `CU2`
+- `cu_receive_validation.csv`: forwarded-vs-received throughput cross-check for both CUs
 
 ### Control and Reconfiguration Overhead CSVs
 
